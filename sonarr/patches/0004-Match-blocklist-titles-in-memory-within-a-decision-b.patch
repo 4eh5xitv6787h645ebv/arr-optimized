@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sonarr-next <sonarr-next@localhost>
+Date: Tue, 24 Nov 2026 22:53:47 +0800
+Subject: [PATCH 4/4] Match blocklist titles in memory within a decision batch
+ (SQLite)
+
+---
+ .../Blocklisting/BlocklistRepository.cs       |  7 ++
+ .../Blocklisting/BlocklistService.cs          | 36 ++++++-
+ src/NzbDrone.Core/Blocklisting/SqliteLike.cs  | 95 +++++++++++++++++++
+ 3 files changed, 136 insertions(+), 2 deletions(-)
+ create mode 100644 src/NzbDrone.Core/Blocklisting/SqliteLike.cs
+
+diff --git a/src/NzbDrone.Core/Blocklisting/BlocklistRepository.cs b/src/NzbDrone.Core/Blocklisting/BlocklistRepository.cs
+index 59111cf..dfa2a98 100644
+--- a/src/NzbDrone.Core/Blocklisting/BlocklistRepository.cs
++++ b/src/NzbDrone.Core/Blocklisting/BlocklistRepository.cs
+@@ -11,6 +11,7 @@ namespace NzbDrone.Core.Blocklisting
+         List<Blocklist> BlocklistedByTitle(int seriesId, string sourceTitle);
+         List<Blocklist> BlocklistedByTorrentInfoHash(int seriesId, string torrentInfoHash);
+         List<Blocklist> BlocklistedBySeries(int seriesId);
++        List<Blocklist> BlocklistedBySeriesForTitleMatch(int seriesId);
+         void DeleteForSeriesIds(List<int> seriesIds);
+     }
+ 
+@@ -31,6 +32,12 @@ namespace NzbDrone.Core.Blocklisting
+             return Query(e => e.SeriesId == seriesId && e.TorrentInfoHash.Contains(torrentInfoHash));
+         }
+ 
++        // All rows of a series when BlocklistedByTitle's LIKE can be evaluated in memory (SQLite only), else null.
++        public List<Blocklist> BlocklistedBySeriesForTitleMatch(int seriesId)
++        {
++            return _database.DatabaseType == DatabaseType.SQLite ? BlocklistedBySeries(seriesId) : null;
++        }
++
+         public List<Blocklist> BlocklistedBySeries(int seriesId)
+         {
+             return Query(b => b.SeriesId == seriesId);
+diff --git a/src/NzbDrone.Core/Blocklisting/BlocklistService.cs b/src/NzbDrone.Core/Blocklisting/BlocklistService.cs
+index cbea38f..7b1805e 100644
+--- a/src/NzbDrone.Core/Blocklisting/BlocklistService.cs
++++ b/src/NzbDrone.Core/Blocklisting/BlocklistService.cs
+@@ -3,6 +3,7 @@ using System.Collections.Generic;
+ using System.Linq;
+ using NzbDrone.Common.Extensions;
+ using NzbDrone.Core.Datastore;
++using NzbDrone.Core.DecisionEngine;
+ using NzbDrone.Core.Download;
+ using NzbDrone.Core.Indexers;
+ using NzbDrone.Core.Messaging.Commands;
+@@ -51,16 +52,47 @@ namespace NzbDrone.Core.Blocklisting
+                     return blocklistedByTorrentInfohash.Any(b => SameTorrent(b, torrentInfo));
+                 }
+ 
+-                return _blocklistRepository.BlocklistedByTitle(seriesId, release.Title)
++                return BlocklistedByTitle(seriesId, release.Title)
+                     .Where(b => b.Protocol == DownloadProtocol.Torrent)
+                     .Any(b => SameTorrent(b, torrentInfo));
+             }
+ 
+-            return _blocklistRepository.BlocklistedByTitle(seriesId, release.Title)
++            return BlocklistedByTitle(seriesId, release.Title)
+                 .Where(b => b.Protocol == DownloadProtocol.Usenet)
+                 .Any(b => SameNzb(b, release));
+         }
+ 
++        // Same rows as BlocklistRepository.BlocklistedByTitle. Inside a decision batch the series' rows are read
++        // once and SQLite's LIKE '%' || title || '%' is evaluated in memory with SQLite's exact rules.
++        private List<Blocklist> BlocklistedByTitle(int seriesId, string title)
++        {
++            if (DecisionScope.Active)
++            {
++                var rows = DecisionScope.Memo("Blocklist", seriesId, () => _blocklistRepository.BlocklistedBySeriesForTitleMatch(seriesId));
++                if (rows != null)
++                {
++                    var matches = new List<Blocklist>();
++                    foreach (var row in rows)
++                    {
++                        var like = SqliteLike.ContainsLike(row.SourceTitle, title);
++                        if (like == null)
++                        {
++                            return _blocklistRepository.BlocklistedByTitle(seriesId, title);
++                        }
++
++                        if (like.Value)
++                        {
++                            matches.Add(row);
++                        }
++                    }
++
++                    return matches;
++                }
++            }
++
++            return _blocklistRepository.BlocklistedByTitle(seriesId, title);
++        }
++
+         public bool BlocklistedTorrentHash(int seriesId, string hash)
+         {
+             return _blocklistRepository.BlocklistedByTorrentInfoHash(seriesId, hash).Any(b =>
+diff --git a/src/NzbDrone.Core/Blocklisting/SqliteLike.cs b/src/NzbDrone.Core/Blocklisting/SqliteLike.cs
+new file mode 100644
+index 0000000..279689c
+--- /dev/null
++++ b/src/NzbDrone.Core/Blocklisting/SqliteLike.cs
+@@ -0,0 +1,95 @@
++namespace NzbDrone.Core.Blocklisting
++{
++    // Exact in-memory evaluation of SQLite's "value LIKE '%' || needle || '%'" as generated for
++    // string.Contains by WhereBuilderSqlite: no ESCAPE clause, case_sensitive_like off, no ICU.
++    // '%' matches any sequence, '_' exactly one character, and only ASCII letters compare
++    // case-insensitively; every other character compares by code point, except that U+FFFE and
++    // U+FFFF compare equal to U+FFFD (see Fold).
++    // Returns null when exact emulation is not guaranteed; the caller must then ask the database.
++    internal static class SqliteLike
++    {
++        private const int MaxPatternBytes = 50000; // SQLITE_MAX_LIKE_PATTERN_LENGTH
++
++        public static bool? ContainsLike(string value, string needle)
++        {
++            if (needle == null || !Plain(needle) || (needle.Length * 3) + 2 > MaxPatternBytes)
++            {
++                return null;
++            }
++
++            if (value == null)
++            {
++                return false; // NULL LIKE pattern is NULL, so the row is not selected.
++            }
++
++            if (!Plain(value))
++            {
++                return null;
++            }
++
++            var pattern = "%" + needle + "%";
++            return Match(pattern, value);
++        }
++
++        // Surrogates and NUL are left to SQLite (UTF-8 conversion and C-string semantics).
++        private static bool Plain(string s)
++        {
++            foreach (var c in s)
++            {
++                if (c == '\0' || char.IsSurrogate(c))
++                {
++                    return false;
++                }
++            }
++
++            return true;
++        }
++
++        // patternCompare reads characters with sqlite3Utf8Read, which returns U+FFFD for the
++        // noncharacters U+FFFE and U+FFFF (surrogates, the other remapped input, never get here).
++        private static char Fold(char c)
++        {
++            if (c >= 'A' && c <= 'Z')
++            {
++                return (char)(c + 32);
++            }
++
++            return c >= '\uFFFE' ? '\uFFFD' : c;
++        }
++
++        // Iterative wildcard match with single-star backtracking; exact for '%' and '_' patterns.
++        private static bool Match(string pattern, string text)
++        {
++            int p = 0, t = 0, star = -1, mark = 0;
++            while (t < text.Length)
++            {
++                if (p < pattern.Length && pattern[p] == '%')
++                {
++                    star = p++;
++                    mark = t;
++                }
++                else if (p < pattern.Length && (pattern[p] == '_' || Fold(pattern[p]) == Fold(text[t])))
++                {
++                    p++;
++                    t++;
++                }
++                else if (star >= 0)
++                {
++                    p = star + 1;
++                    t = ++mark;
++                }
++                else
++                {
++                    return false;
++                }
++            }
++
++            while (p < pattern.Length && pattern[p] == '%')
++            {
++                p++;
++            }
++
++            return p == pattern.Length;
++        }
++    }
++}

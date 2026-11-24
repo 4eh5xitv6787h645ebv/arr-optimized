@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sonarr-next <sonarr-next@localhost>
+Date: Tue, 24 Nov 2026 22:53:47 +0800
+Subject: [PATCH 2/4] Cache Database.DatabaseType instead of opening a
+ connection per query
+
+---
+ src/NzbDrone.Core/Datastore/Database.cs | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/NzbDrone.Core/Datastore/Database.cs b/src/NzbDrone.Core/Datastore/Database.cs
+index 02e6875..ec55a63 100644
+--- a/src/NzbDrone.Core/Datastore/Database.cs
++++ b/src/NzbDrone.Core/Datastore/Database.cs
+@@ -1,4 +1,5 @@
+ using System;
++using System.Threading;
+ using System.Data.Common;
+ using System.Data.SQLite;
+ using Dapper;
+@@ -34,13 +35,25 @@ namespace NzbDrone.Core.Datastore
+             return _datamapperFactory();
+         }
+ 
++        // Every repository query reads this (via SqlBuilder). The connection type a factory produces never
++        // changes, so open a connection only for the first read instead of once per query.
++        private int _databaseType = -1;
++
+         public DatabaseType DatabaseType
+         {
+             get
+             {
++                var known = Volatile.Read(ref _databaseType);
++                if (known >= 0)
++                {
++                    return (DatabaseType)known;
++                }
++
+                 using var db = _datamapperFactory();
+ 
+-                return db is SQLiteConnection ? DatabaseType.SQLite : DatabaseType.PostgreSQL;
++                var type = db is SQLiteConnection ? DatabaseType.SQLite : DatabaseType.PostgreSQL;
++                Volatile.Write(ref _databaseType, (int)type);
++                return type;
+             }
+         }
+ 

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Runs against a built Sonarr.Core.dll (CoreBin) and the unchanged managed dependencies
+    from the matching upstream image (StockBin, e.g. /app/sonarr/bin copied out of the image).
+      see ../README.md for the run command
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Sonarr.Core"><HintPath>$(CoreBin)/Sonarr.Core.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Sonarr.Common"><HintPath>$(StockBin)/Sonarr.Common.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Equ"><HintPath>$(StockBin)/Equ.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="NLog"><HintPath>$(StockBin)/NLog.dll</HintPath><Private>false</Private></Reference>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.11" />
+  </ItemGroup>
+</Project>

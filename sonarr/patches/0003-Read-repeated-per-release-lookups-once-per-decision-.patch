@@ -1,0 +1,508 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sonarr-next <sonarr-next@localhost>
+Date: Tue, 24 Nov 2026 22:53:47 +0800
+Subject: [PATCH 3/4] Read repeated per-release lookups once per decision batch
+
+---
+ .../Datastore/BasicRepository.cs              | 105 ++++++++++++++----
+ .../DecisionEngine/DecisionScope.cs           |  90 +++++++++++++++
+ .../DecisionEngine/DownloadDecisionMaker.cs   |  10 +-
+ .../AlreadyImportedSpecification.cs           |   2 +-
+ .../RssSync/IndexerTagSpecification.cs        |   2 +-
+ .../SameEpisodesSpecification.cs              |   2 +-
+ .../TorrentSeedingSpecification.cs            |   2 +-
+ .../Aggregators/AggregateLanguages.cs         |   3 +-
+ .../Housekeepers/CleanupOrphanedBlocklist.cs  |   2 +
+ .../Housekeepers/CleanupOrphanedEpisodes.cs   |   2 +
+ .../CleanupOrphanedHistoryItems.cs            |   2 +
+ .../Releases/ReleaseProfileService.cs         |   4 +-
+ .../ThingiProvider/ProviderRepository.cs      |   6 +-
+ 13 files changed, 199 insertions(+), 33 deletions(-)
+ create mode 100644 src/NzbDrone.Core/DecisionEngine/DecisionScope.cs
+
+diff --git a/src/NzbDrone.Core/Datastore/BasicRepository.cs b/src/NzbDrone.Core/Datastore/BasicRepository.cs
+index bef0e1a..9d57f00 100644
+--- a/src/NzbDrone.Core/Datastore/BasicRepository.cs
++++ b/src/NzbDrone.Core/Datastore/BasicRepository.cs
+@@ -10,6 +10,7 @@ using Dapper;
+ using NLog;
+ using NzbDrone.Common.Instrumentation;
+ using NzbDrone.Core.Datastore.Events;
++using NzbDrone.Core.DecisionEngine;
+ using NzbDrone.Core.Messaging.Events;
+ using Polly;
+ using Polly.Retry;
+@@ -165,9 +166,16 @@ namespace NzbDrone.Core.Datastore
+                 throw new InvalidOperationException("Can't insert model with existing ID " + model.Id);
+             }
+ 
+-            using (var conn = _database.OpenConnection())
++            try
++            {
++                using (var conn = _database.OpenConnection())
++                {
++                    model = Insert(conn, null, model);
++                }
++            }
++            finally
+             {
+-                model = Insert(conn, null, model);
++                DecisionScope.TableChanged(_table);
+             }
+ 
+             ModelCreated(model);
+@@ -227,18 +235,25 @@ namespace NzbDrone.Core.Datastore
+                 throw new InvalidOperationException("Can't insert model with existing ID != 0");
+             }
+ 
+-            using (var conn = _database.OpenConnection())
++            try
+             {
+-                using (var tran = conn.BeginTransaction(IsolationLevel.ReadCommitted))
++                using (var conn = _database.OpenConnection())
+                 {
+-                    foreach (var model in models)
++                    using (var tran = conn.BeginTransaction(IsolationLevel.ReadCommitted))
+                     {
+-                        Insert(conn, tran, model);
+-                    }
++                        foreach (var model in models)
++                        {
++                            Insert(conn, tran, model);
++                        }
+ 
+-                    tran.Commit();
++                        tran.Commit();
++                    }
+                 }
+             }
++            finally
++            {
++                DecisionScope.TableChanged(_table);
++            }
+         }
+ 
+         public TModel Update(TModel model)
+@@ -248,9 +263,16 @@ namespace NzbDrone.Core.Datastore
+                 throw new InvalidOperationException("Can't update model with ID 0");
+             }
+ 
+-            using (var conn = _database.OpenConnection())
++            try
++            {
++                using (var conn = _database.OpenConnection())
++                {
++                    UpdateFields(conn, null, model, _properties);
++                }
++            }
++            finally
+             {
+-                UpdateFields(conn, null, model, _properties);
++                DecisionScope.TableChanged(_table);
+             }
+ 
+             ModelUpdated(model);
+@@ -265,11 +287,18 @@ namespace NzbDrone.Core.Datastore
+                 throw new InvalidOperationException("Can't update model with ID 0");
+             }
+ 
+-            using (var conn = _database.OpenConnection())
+-            using (var tran = conn.BeginTransaction(IsolationLevel.ReadCommitted))
++            try
++            {
++                using (var conn = _database.OpenConnection())
++                using (var tran = conn.BeginTransaction(IsolationLevel.ReadCommitted))
++                {
++                    UpdateFields(conn, tran, models, _properties);
++                    tran.Commit();
++                }
++            }
++            finally
+             {
+-                UpdateFields(conn, tran, models, _properties);
+-                tran.Commit();
++                DecisionScope.TableChanged(_table);
+             }
+         }
+ 
+@@ -282,9 +311,16 @@ namespace NzbDrone.Core.Datastore
+         {
+             var sql = builder.AddDeleteTemplate(typeof(TModel));
+ 
+-            using (var conn = _database.OpenConnection())
++            try
++            {
++                using (var conn = _database.OpenConnection())
++                {
++                    conn.Execute(sql.RawSql, sql.Parameters);
++                }
++            }
++            finally
+             {
+-                conn.Execute(sql.RawSql, sql.Parameters);
++                DecisionScope.TableChanged(_table);
+             }
+         }
+ 
+@@ -325,9 +361,16 @@ namespace NzbDrone.Core.Datastore
+ 
+         public void Purge(bool vacuum = false)
+         {
+-            using (var conn = _database.OpenConnection())
++            try
++            {
++                using (var conn = _database.OpenConnection())
++                {
++                    conn.Execute($"DELETE FROM \"{_table}\"");
++                }
++            }
++            finally
+             {
+-                conn.Execute($"DELETE FROM \"{_table}\"");
++                DecisionScope.TableChanged(_table);
+             }
+ 
+             if (vacuum)
+@@ -355,9 +398,16 @@ namespace NzbDrone.Core.Datastore
+ 
+             var propertiesToUpdate = properties.Select(x => x.GetMemberName()).ToList();
+ 
+-            using (var conn = _database.OpenConnection())
++            try
+             {
+-                UpdateFields(conn, null, model, propertiesToUpdate);
++                using (var conn = _database.OpenConnection())
++                {
++                    UpdateFields(conn, null, model, propertiesToUpdate);
++                }
++            }
++            finally
++            {
++                DecisionScope.TableChanged(_table);
+             }
+ 
+             ModelUpdated(model);
+@@ -372,11 +422,18 @@ namespace NzbDrone.Core.Datastore
+ 
+             var propertiesToUpdate = properties.Select(x => x.GetMemberName()).ToList();
+ 
+-            using (var conn = _database.OpenConnection())
+-            using (var tran = conn.BeginTransaction(IsolationLevel.ReadCommitted))
++            try
++            {
++                using (var conn = _database.OpenConnection())
++                using (var tran = conn.BeginTransaction(IsolationLevel.ReadCommitted))
++                {
++                    UpdateFields(conn, tran, models, propertiesToUpdate);
++                    tran.Commit();
++                }
++            }
++            finally
+             {
+-                UpdateFields(conn, tran, models, propertiesToUpdate);
+-                tran.Commit();
++                DecisionScope.TableChanged(_table);
+             }
+ 
+             foreach (var model in models)
+diff --git a/src/NzbDrone.Core/DecisionEngine/DecisionScope.cs b/src/NzbDrone.Core/DecisionEngine/DecisionScope.cs
+new file mode 100644
+index 0000000..b812e31
+--- /dev/null
++++ b/src/NzbDrone.Core/DecisionEngine/DecisionScope.cs
+@@ -0,0 +1,90 @@
++using System;
++using System.Collections.Concurrent;
++using System.Collections.Generic;
++
++namespace NzbDrone.Core.DecisionEngine
++{
++    // Read-through memo for one synchronous batch of download decisions (one GetRssDecision or
++    // GetSearchDecision call). Specifications re-read the same rows for every release in a batch:
++    // indexer definition, release profiles, episode history, episodes in a file and the series'
++    // blocklist. Inside a batch they are read once. Nothing is kept after the batch; outside a batch
++    // the loader runs directly. Only read-only consumers use this.
++    //
++    // Exactness rules:
++    // - The kind is the name of the table the loader reads. Every write to that table through
++    //   BasicRepository (and the raw-SQL housekeepers) calls TableChanged after it commits, so a row
++    //   written while a batch runs (e.g. by Completed Download Handling on another thread) is seen by
++    //   the next lookup, as it would be without the memo. (EpisodeRepository's raw-SQL updates of
++    //   Episodes.Monitored are not reported: the Episodes memo's only consumer reads episode ids.)
++    // - null results and exceptions are never stored: the loader runs again next time, so a missing
++    //   row behaves exactly as before (IIndexerFactory.Find returns null where Get throws, and both
++    //   read the same key).
++    internal sealed class DecisionScope : IDisposable
++    {
++        private static readonly ConcurrentDictionary<string, long> TableVersions = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
++
++        [ThreadStatic]
++        private static DecisionScope _current;
++
++        private readonly Dictionary<(string Kind, int Id), (long Version, object Value)> _values;
++
++        private DecisionScope(bool owner)
++        {
++            _values = owner ? new Dictionary<(string Kind, int Id), (long Version, object Value)>() : null;
++        }
++
++        public static bool Active => _current != null;
++
++        public static DecisionScope Begin()
++        {
++            if (_current != null)
++            {
++                return new DecisionScope(false);
++            }
++
++            _current = new DecisionScope(true);
++            return _current;
++        }
++
++        // Call after a write to the table has committed.
++        public static void TableChanged(string table)
++        {
++            TableVersions.AddOrUpdate(table, 1, static (_, version) => version + 1);
++        }
++
++        public static T Memo<T>(string kind, int id, Func<T> load)
++            where T : class
++        {
++            var scope = _current;
++            if (scope == null)
++            {
++                return load();
++            }
++
++            // Read the version before loading: a write that commits during the load leaves the stored
++            // version behind, so the next lookup loads again.
++            TableVersions.TryGetValue(kind, out var version);
++
++            if (scope._values.TryGetValue((kind, id), out var entry) && entry.Version == version)
++            {
++                return (T)entry.Value;
++            }
++
++            var result = load();
++            if (result != null)
++            {
++                scope._values[(kind, id)] = (version, result);
++            }
++
++            return result;
++        }
++
++        public void Dispose()
++        {
++            if (_values != null && ReferenceEquals(_current, this))
++            {
++                _current = null;
++            }
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/DecisionEngine/DownloadDecisionMaker.cs b/src/NzbDrone.Core/DecisionEngine/DownloadDecisionMaker.cs
+index 05049cd..a202c16 100644
+--- a/src/NzbDrone.Core/DecisionEngine/DownloadDecisionMaker.cs
++++ b/src/NzbDrone.Core/DecisionEngine/DownloadDecisionMaker.cs
+@@ -47,12 +47,18 @@ namespace NzbDrone.Core.DecisionEngine
+ 
+         public List<DownloadDecision> GetRssDecision(List<ReleaseInfo> reports, bool pushedRelease = false)
+         {
+-            return GetDecisions(reports, pushedRelease).ToList();
++            using (DecisionScope.Begin())
++            {
++                return GetDecisions(reports, pushedRelease).ToList();
++            }
+         }
+ 
+         public List<DownloadDecision> GetSearchDecision(List<ReleaseInfo> reports, SearchCriteriaBase searchCriteriaBase)
+         {
+-            return GetDecisions(reports, false, searchCriteriaBase).ToList();
++            using (DecisionScope.Begin())
++            {
++                return GetDecisions(reports, false, searchCriteriaBase).ToList();
++            }
+         }
+ 
+         private IEnumerable<DownloadDecision> GetDecisions(List<ReleaseInfo> reports, bool pushedRelease, SearchCriteriaBase searchCriteria = null)
+diff --git a/src/NzbDrone.Core/DecisionEngine/Specifications/AlreadyImportedSpecification.cs b/src/NzbDrone.Core/DecisionEngine/Specifications/AlreadyImportedSpecification.cs
+index ea5dde1..ed19ae6 100644
+--- a/src/NzbDrone.Core/DecisionEngine/Specifications/AlreadyImportedSpecification.cs
++++ b/src/NzbDrone.Core/DecisionEngine/Specifications/AlreadyImportedSpecification.cs
+@@ -45,7 +45,7 @@ namespace NzbDrone.Core.DecisionEngine.Specifications
+                     continue;
+                 }
+ 
+-                var historyForEpisode = _historyService.FindByEpisodeId(episode.Id);
++                var historyForEpisode = DecisionScope.Memo("History", episode.Id, () => _historyService.FindByEpisodeId(episode.Id));
+                 var lastGrabbed = historyForEpisode.FirstOrDefault(h => h.EventType == EpisodeHistoryEventType.Grabbed);
+ 
+                 if (lastGrabbed == null)
+diff --git a/src/NzbDrone.Core/DecisionEngine/Specifications/RssSync/IndexerTagSpecification.cs b/src/NzbDrone.Core/DecisionEngine/Specifications/RssSync/IndexerTagSpecification.cs
+index 24f066a..541bff2 100644
+--- a/src/NzbDrone.Core/DecisionEngine/Specifications/RssSync/IndexerTagSpecification.cs
++++ b/src/NzbDrone.Core/DecisionEngine/Specifications/RssSync/IndexerTagSpecification.cs
+@@ -31,7 +31,7 @@ namespace NzbDrone.Core.DecisionEngine.Specifications.RssSync
+             IndexerDefinition indexer;
+             try
+             {
+-                indexer = _indexerFactory.Get(subject.Release.IndexerId);
++                indexer = DecisionScope.Memo("Indexers", subject.Release.IndexerId, () => _indexerFactory.Get(subject.Release.IndexerId));
+             }
+             catch (ModelNotFoundException)
+             {
+diff --git a/src/NzbDrone.Core/DecisionEngine/Specifications/SameEpisodesSpecification.cs b/src/NzbDrone.Core/DecisionEngine/Specifications/SameEpisodesSpecification.cs
+index 337e2fb..1d725f1 100644
+--- a/src/NzbDrone.Core/DecisionEngine/Specifications/SameEpisodesSpecification.cs
++++ b/src/NzbDrone.Core/DecisionEngine/Specifications/SameEpisodesSpecification.cs
+@@ -21,7 +21,7 @@ namespace NzbDrone.Core.DecisionEngine.Specifications
+ 
+             foreach (var episodeFileId in episodeFileIds)
+             {
+-                var episodesInFile = _episodeService.GetEpisodesByFileId(episodeFileId);
++                var episodesInFile = DecisionScope.Memo("Episodes", episodeFileId, () => _episodeService.GetEpisodesByFileId(episodeFileId));
+ 
+                 if (episodesInFile.Select(e => e.Id).Except(episodeIds).Any())
+                 {
+diff --git a/src/NzbDrone.Core/DecisionEngine/Specifications/TorrentSeedingSpecification.cs b/src/NzbDrone.Core/DecisionEngine/Specifications/TorrentSeedingSpecification.cs
+index a42f426..dfb724e 100644
+--- a/src/NzbDrone.Core/DecisionEngine/Specifications/TorrentSeedingSpecification.cs
++++ b/src/NzbDrone.Core/DecisionEngine/Specifications/TorrentSeedingSpecification.cs
+@@ -31,7 +31,7 @@ namespace NzbDrone.Core.DecisionEngine.Specifications
+             IndexerDefinition indexer;
+             try
+             {
+-                indexer = _indexerFactory.Get(torrentInfo.IndexerId);
++                indexer = DecisionScope.Memo("Indexers", torrentInfo.IndexerId, () => _indexerFactory.Get(torrentInfo.IndexerId));
+             }
+             catch (ModelNotFoundException)
+             {
+diff --git a/src/NzbDrone.Core/Download/Aggregation/Aggregators/AggregateLanguages.cs b/src/NzbDrone.Core/Download/Aggregation/Aggregators/AggregateLanguages.cs
+index f08b5c7..6659603 100644
+--- a/src/NzbDrone.Core/Download/Aggregation/Aggregators/AggregateLanguages.cs
++++ b/src/NzbDrone.Core/Download/Aggregation/Aggregators/AggregateLanguages.cs
+@@ -3,6 +3,7 @@ using System.Collections.Generic;
+ using System.Linq;
+ using NLog;
+ using NzbDrone.Common.Extensions;
++using NzbDrone.Core.DecisionEngine;
+ using NzbDrone.Core.Indexers;
+ using NzbDrone.Core.Languages;
+ using NzbDrone.Core.Parser;
+@@ -82,7 +83,7 @@ namespace NzbDrone.Core.Download.Aggregation.Aggregators
+ 
+                 if (releaseInfo is { IndexerId: > 0 })
+                 {
+-                    indexer = _indexerFactory.Find(releaseInfo.IndexerId);
++                    indexer = DecisionScope.Memo("Indexers", releaseInfo.IndexerId, () => _indexerFactory.Find(releaseInfo.IndexerId));
+                 }
+ 
+                 if (indexer == null && releaseInfo.Indexer?.IsNotNullOrWhiteSpace() == true)
+diff --git a/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupOrphanedBlocklist.cs b/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupOrphanedBlocklist.cs
+index bc3677e..cbe5c72 100644
+--- a/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupOrphanedBlocklist.cs
++++ b/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupOrphanedBlocklist.cs
+@@ -1,5 +1,6 @@
+ using Dapper;
+ using NzbDrone.Core.Datastore;
++using NzbDrone.Core.DecisionEngine;
+ 
+ namespace NzbDrone.Core.Housekeeping.Housekeepers
+ {
+@@ -21,6 +22,7 @@ namespace NzbDrone.Core.Housekeeping.Housekeepers
+                                      LEFT OUTER JOIN ""Series""
+                                      ON ""Blocklist"".""SeriesId"" = ""Series"".""Id""
+                                      WHERE ""Series"".""Id"" IS NULL)");
++            DecisionScope.TableChanged("Blocklist");
+         }
+     }
+ }
+diff --git a/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupOrphanedEpisodes.cs b/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupOrphanedEpisodes.cs
+index b349d2b..5c27ee7 100644
+--- a/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupOrphanedEpisodes.cs
++++ b/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupOrphanedEpisodes.cs
+@@ -1,5 +1,6 @@
+ using Dapper;
+ using NzbDrone.Core.Datastore;
++using NzbDrone.Core.DecisionEngine;
+ 
+ namespace NzbDrone.Core.Housekeeping.Housekeepers
+ {
+@@ -21,6 +22,7 @@ namespace NzbDrone.Core.Housekeeping.Housekeepers
+                                      LEFT OUTER JOIN ""Series""
+                                      ON ""Episodes"".""SeriesId"" = ""Series"".""Id""
+                                      WHERE ""Series"".""Id"" IS NULL)");
++            DecisionScope.TableChanged("Episodes");
+         }
+     }
+ }
+diff --git a/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupOrphanedHistoryItems.cs b/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupOrphanedHistoryItems.cs
+index 6fb2b15..b493c1e 100644
+--- a/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupOrphanedHistoryItems.cs
++++ b/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupOrphanedHistoryItems.cs
+@@ -1,5 +1,6 @@
+ using Dapper;
+ using NzbDrone.Core.Datastore;
++using NzbDrone.Core.DecisionEngine;
+ 
+ namespace NzbDrone.Core.Housekeeping.Housekeepers
+ {
+@@ -16,6 +17,7 @@ namespace NzbDrone.Core.Housekeeping.Housekeepers
+         {
+             CleanupOrphanedBySeries();
+             CleanupOrphanedByEpisode();
++            DecisionScope.TableChanged("History");
+         }
+ 
+         private void CleanupOrphanedBySeries()
+diff --git a/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs b/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
+index d493fe2..7e09863 100644
+--- a/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
++++ b/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
+@@ -1,6 +1,7 @@
+ using System.Collections.Generic;
+ using System.Linq;
+ using NzbDrone.Common.Extensions;
++using NzbDrone.Core.DecisionEngine;
+ 
+ namespace NzbDrone.Core.Profiles.Releases
+ {
+@@ -45,7 +46,8 @@ namespace NzbDrone.Core.Profiles.Releases
+ 
+         public List<ReleaseProfile> AllForTags(HashSet<int> tagIds)
+         {
+-            return _repo.All().Where(r => (r.Tags.Intersect(tagIds).Any() || r.Tags.Empty()) && !r.ExcludedTags.Intersect(tagIds).Any()).ToList();
++            var all = DecisionScope.Memo("ReleaseProfiles", 0, () => _repo.All().ToList());
++            return all.Where(r => (r.Tags.Intersect(tagIds).Any() || r.Tags.Empty()) && !r.ExcludedTags.Intersect(tagIds).Any()).ToList();
+         }
+ 
+         public List<ReleaseProfile> EnabledForTags(HashSet<int> tagIds, int indexerId)
+diff --git a/src/NzbDrone.Core/ThingiProvider/ProviderRepository.cs b/src/NzbDrone.Core/ThingiProvider/ProviderRepository.cs
+index 44000f8..843020a 100644
+--- a/src/NzbDrone.Core/ThingiProvider/ProviderRepository.cs
++++ b/src/NzbDrone.Core/ThingiProvider/ProviderRepository.cs
+@@ -1,3 +1,5 @@
++using System;
++using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.Text.Json;
+ using System.Text.Json.Serialization;
+@@ -13,6 +15,8 @@ namespace NzbDrone.Core.ThingiProvider
+     public class ProviderRepository<TProviderDefinition> : BasicRepository<TProviderDefinition>, IProviderRepository<TProviderDefinition>
+         where TProviderDefinition : ProviderDefinition, new()
+     {
++        // The assembly's exported types never change at runtime; FindTypeByName scans all of them per row.
++        private static readonly ConcurrentDictionary<string, Type> ConfigTypes = new ConcurrentDictionary<string, Type>();
+         protected readonly JsonSerializerOptions _serializerSettings;
+ 
+         protected ProviderRepository(IMainDatabase database, IEventAggregator eventAggregator)
+@@ -52,7 +56,7 @@ namespace NzbDrone.Core.ThingiProvider
+                 {
+                     var body = reader.IsDBNull(settingsIndex) ? null : reader.GetString(settingsIndex);
+                     var item = parser(reader);
+-                    var impType = typeof(IProviderConfig).Assembly.FindTypeByName(item.ConfigContract);
++                    var impType = ConfigTypes.GetOrAdd(item.ConfigContract ?? string.Empty, name => typeof(IProviderConfig).Assembly.FindTypeByName(name));
+ 
+                     if (body.IsNullOrWhiteSpace() || impType == null)
+                     {

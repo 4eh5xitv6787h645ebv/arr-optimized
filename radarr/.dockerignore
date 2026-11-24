@@ -1,0 +1,4 @@
+*
+!Dockerfile
+!artifacts/
+!artifacts/Radarr.Core.dll

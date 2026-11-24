@@ -1,0 +1,556 @@
+diff --git a/src/NzbDrone.Core/CustomFormats/CustomFormatCalculationService.cs b/src/NzbDrone.Core/CustomFormats/CustomFormatCalculationService.cs
+index 1745296..4f93e59 100644
+--- a/src/NzbDrone.Core/CustomFormats/CustomFormatCalculationService.cs
++++ b/src/NzbDrone.Core/CustomFormats/CustomFormatCalculationService.cs
+@@ -150,20 +150,36 @@ private List<CustomFormat> ParseCustomFormat(CustomFormatInput input)
+         }
+ 
+         private static List<CustomFormat> ParseCustomFormat(CustomFormatInput input, List<CustomFormat> allCustomFormats)
++        {
++            return CustomFormatMatchCache.Parse(input, allCustomFormats, EvaluateCustomFormats);
++        }
++
++        private static List<CustomFormat> EvaluateCustomFormats(CustomFormatInput input, List<CustomFormat> allCustomFormats)
+         {
+             var matches = new List<CustomFormat>();
+ 
+             foreach (var customFormat in allCustomFormats)
+             {
+-                var specificationMatches = customFormat.Specifications
+-                    .GroupBy(t => t.GetType())
+-                    .Select(g => new SpecificationMatchesGroup
++                // Required checks must all pass. Once they do, optional checks
++                // of the same type cannot change that group's outcome.
++                // Test cheap metadata groups before expensive regular expressions.
++                var matched = true;
++                foreach (var group in customFormat.Specifications.GroupBy(t => t.GetType())
++                    .OrderBy(g => typeof(RegexSpecificationBase).IsAssignableFrom(g.Key) ? 1 : 0))
++                {
++                    var required = group.Where(t => t.Required).ToArray();
++                    var groupMatches = required.Length > 0
++                        ? required.All(t => t.IsSatisfiedBy(input))
++                        : group.Any(t => t.IsSatisfiedBy(input));
++
++                    if (!groupMatches)
+                     {
+-                        Matches = g.ToDictionary(t => t, t => t.IsSatisfiedBy(input))
+-                    })
+-                    .ToList();
++                        matched = false;
++                        break;
++                    }
++                }
+ 
+-                if (specificationMatches.All(x => x.DidMatch))
++                if (matched)
+                 {
+                     matches.Add(customFormat);
+                 }
+diff --git a/src/NzbDrone.Core/CustomFormats/CustomFormatMatchCache.cs b/src/NzbDrone.Core/CustomFormats/CustomFormatMatchCache.cs
+new file mode 100644
+index 0000000..72582a3
+--- /dev/null
++++ b/src/NzbDrone.Core/CustomFormats/CustomFormatMatchCache.cs
+@@ -0,0 +1,325 @@
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.Linq;
++
++namespace NzbDrone.Core.CustomFormats
++{
++    // Caches which custom formats MATCH a release input. Profile scores and every
++    // download decision are still computed live. Limited to the specification types
++    // known to this app version; anything else bypasses the cache.
++    //
++    // The key holds every input any supported specification reads, so an entry can
++    // never be stale for its key; definition edits replace the plan (and its entries)
++    // immediately. Expiry therefore only bounds memory: entries idle for SlidingMs are
++    // dropped, every hit refreshes the entry, and at Capacity the least recently used
++    // entry is evicted.
++    internal static class CustomFormatMatchCache
++    {
++        internal const int Capacity = 50_000;
++        internal const long SlidingMs = 6L * 60 * 60 * 1000;
++        internal const int MaxTextLength = 4096;
++
++        private static readonly object Gate = new object();
++        private static Plan _plan;
++
++        // Monotonic milliseconds; replaceable by tests.
++        internal static Func<long> Clock = () => Environment.TickCount64;
++        internal static long Hits;
++        internal static long Misses;
++        internal static long Evictions;
++        internal static long Expirations;
++
++        private sealed record Key(string Title, string Filename, string Group, string Edition,
++            int Resolution, int Source, int Modifier, long Size, int Flags,
++            string Languages, int? OriginalLanguage, int? Year, string Culture, bool HasInfo, bool HasOwner);
++
++        private sealed class Entry
++        {
++            internal Key Key;
++            internal int[] Indices;
++            internal long LastUsed;
++        }
++
++        private sealed class Format
++        {
++            internal int Id;
++            internal string Name;
++            internal ICustomFormatSpecification[] Specs;
++            internal ICustomFormatSpecification[] References;
++            internal ICustomFormatSpecification[][] Groups;
++        }
++
++        private sealed class Plan
++        {
++            internal Format[] Formats;
++            internal bool OriginalLanguage;
++            internal bool Year;
++            internal readonly Dictionary<Key, LinkedListNode<Entry>> Results = new Dictionary<Key, LinkedListNode<Entry>>();
++
++            // Most recently used first.
++            internal readonly LinkedList<Entry> Recency = new LinkedList<Entry>();
++        }
++
++        private static bool Known(ICustomFormatSpecification spec)
++        {
++            var type = spec.GetType();
++            return type == typeof(ReleaseTitleSpecification) ||
++                type == typeof(ReleaseGroupSpecification) ||
++                type == typeof(LanguageSpecification) ||
++                type == typeof(SizeSpecification) ||
++                type == typeof(IndexerFlagSpecification) ||
++                type == typeof(ResolutionSpecification) ||
++                type == typeof(SourceSpecification) ||
++                type == typeof(EditionSpecification) ||
++                type == typeof(QualityModifierSpecification) ||
++                type == typeof(YearSpecification);
++        }
++
++        private static bool Same(ICustomFormatSpecification a, ICustomFormatSpecification b)
++        {
++            if (a.GetType() != b.GetType() || a.Required != b.Required || a.Negate != b.Negate)
++            {
++                return false;
++            }
++
++            return a switch
++            {
++                RegexSpecificationBase r => r.Value == ((RegexSpecificationBase)b).Value,
++                LanguageSpecification l => l.Value == ((LanguageSpecification)b).Value && l.ExceptLanguage == ((LanguageSpecification)b).ExceptLanguage,
++                SizeSpecification s => s.Min == ((SizeSpecification)b).Min && s.Max == ((SizeSpecification)b).Max,
++                IndexerFlagSpecification i => i.Value == ((IndexerFlagSpecification)b).Value,
++                ResolutionSpecification r => r.Value == ((ResolutionSpecification)b).Value,
++                SourceSpecification s => s.Value == ((SourceSpecification)b).Value,
++                QualityModifierSpecification q => q.Value == ((QualityModifierSpecification)b).Value,
++                YearSpecification y => y.Min == ((YearSpecification)b).Min && y.Max == ((YearSpecification)b).Max,
++                _ => false
++            };
++        }
++
++        private static bool Current(Plan plan, List<CustomFormat> formats)
++        {
++            if (plan == null || plan.Formats.Length != formats.Count)
++            {
++                return false;
++            }
++
++            for (var i = 0; i < formats.Count; i++)
++            {
++                var old = plan.Formats[i];
++                var current = formats[i];
++                if (old.Id != current.Id || old.Name != current.Name || old.Specs.Length != current.Specifications.Count)
++                {
++                    return false;
++                }
++
++                for (var j = 0; j < old.Specs.Length; j++)
++                {
++                    if (!ReferenceEquals(old.References[j], current.Specifications[j]) || !Same(old.Specs[j], current.Specifications[j]))
++                    {
++                        return false;
++                    }
++                }
++            }
++
++            return true;
++        }
++
++        private static Plan Build(List<CustomFormat> formats)
++        {
++            if (formats.Any(f => f.Specifications.Any(s => !Known(s))))
++            {
++                return null;
++            }
++
++            return new Plan
++            {
++                OriginalLanguage = formats.Any(f => f.Specifications.Any(s => s is LanguageSpecification l && l.Value == NzbDrone.Core.Languages.Language.Original.Id)),
++                Year = formats.Any(f => f.Specifications.Any(s => s is YearSpecification)),
++                Formats = formats.Select(f =>
++                {
++                    var specs = f.Specifications.Select(s => s.Clone()).ToArray();
++                    return new Format
++                    {
++                        Id = f.Id,
++                        Name = f.Name,
++                        Specs = specs,
++                        References = f.Specifications.ToArray(),
++                        Groups = specs.GroupBy(s => s.GetType())
++                            .OrderBy(g => typeof(RegexSpecificationBase).IsAssignableFrom(g.Key) ? 1 : 0)
++                            .Select(g => g.ToArray()).ToArray()
++                    };
++                }).ToArray()
++            };
++        }
++
++        private static Key InputKey(CustomFormatInput input, Plan plan)
++        {
++            var info = input.MovieInfo;
++            var movie = input.Movie;
++            var quality = info?.Quality?.Quality;
++
++            // Mirrors LanguageSpecification: the movie's original language is only consulted
++            // when both parsed info and a movie are present.
++            var original = plan.OriginalLanguage && info != null && movie != null
++                ? movie.MovieMetadata.Value.OriginalLanguage?.Id
++                : null;
++
++            // Mirrors YearSpecification exactly: a parsed year > 0 wins, otherwise the movie's year.
++            var year = plan.Year
++                ? info?.Year is > 0 ? info.Year : movie?.MovieMetadata?.Value?.Year
++                : null;
++
++            return new Key(info?.SimpleReleaseTitle, input.Filename, info?.ReleaseGroup,
++                info?.Edition, quality?.Resolution ?? 0, (int)(quality?.Source ?? 0), (int)(quality?.Modifier ?? 0),
++                input.Size, (int)input.IndexerFlags,
++                input.Languages == null ? null : string.Join(",", input.Languages.Select(l => l == null ? "null" : l.Id.ToString(CultureInfo.InvariantCulture))),
++                original, year, CultureInfo.CurrentCulture.Name, info != null, movie != null);
++        }
++
++        private static int[] Calculate(CustomFormatInput input, Plan plan)
++        {
++            List<int> matches = null;
++            for (var i = 0; i < plan.Formats.Length; i++)
++            {
++                var matched = true;
++                foreach (var group in plan.Formats[i].Groups)
++                {
++                    // Required checks must all pass; once they do, optional checks of the
++                    // same type cannot change the group's outcome.
++                    var hasRequired = false;
++                    var requiredPass = true;
++                    foreach (var spec in group)
++                    {
++                        if (spec.Required)
++                        {
++                            hasRequired = true;
++                            if (!spec.IsSatisfiedBy(input))
++                            {
++                                requiredPass = false;
++                                break;
++                            }
++                        }
++                    }
++
++                    if (hasRequired ? !requiredPass : !group.Any(s => s.IsSatisfiedBy(input)))
++                    {
++                        matched = false;
++                        break;
++                    }
++                }
++
++                if (matched)
++                {
++                    (matches ??= new List<int>()).Add(i);
++                }
++            }
++
++            return matches == null ? Array.Empty<int>() : matches.OrderBy(i => plan.Formats[i].Name).ToArray();
++        }
++
++        internal static List<CustomFormat> Parse(CustomFormatInput input, List<CustomFormat> formats,
++            Func<CustomFormatInput, List<CustomFormat>, List<CustomFormat>> uncached)
++        {
++            Plan plan;
++            lock (Gate)
++            {
++                if (!Current(_plan, formats))
++                {
++                    _plan = Build(formats);
++                }
++
++                plan = _plan;
++            }
++
++            if (plan == null)
++            {
++                return uncached(input, formats);
++            }
++
++            var key = InputKey(input, plan);
++
++            // Bound retained text as well as entry count. Oversized inputs are evaluated normally.
++            var cacheable = (key.Title?.Length ?? 0) + (key.Filename?.Length ?? 0) +
++                (key.Group?.Length ?? 0) + (key.Edition?.Length ?? 0) + (key.Languages?.Length ?? 0) <= MaxTextLength;
++
++            lock (Gate)
++            {
++                if (cacheable && plan.Results.TryGetValue(key, out var node))
++                {
++                    var now = Clock();
++                    if (now - node.Value.LastUsed < SlidingMs)
++                    {
++                        // Sliding expiry: a hit refreshes the entry and makes it most recent.
++                        node.Value.LastUsed = now;
++                        if (node != plan.Recency.First)
++                        {
++                            plan.Recency.Remove(node);
++                            plan.Recency.AddFirst(node);
++                        }
++
++                        Hits++;
++                        return Materialize(node.Value.Indices, formats);
++                    }
++
++                    plan.Results.Remove(key);
++                    plan.Recency.Remove(node);
++                    Expirations++;
++                }
++
++                Misses++;
++            }
++
++            var indices = Calculate(input, plan);
++            lock (Gate)
++            {
++                // An in-flight old calculation cannot repopulate a newer definition generation.
++                if (cacheable && ReferenceEquals(plan, _plan))
++                {
++                    var now = Clock();
++                    if (plan.Results.TryGetValue(key, out var existing))
++                    {
++                        existing.Value.Indices = indices;
++                        existing.Value.LastUsed = now;
++                        plan.Recency.Remove(existing);
++                        plan.Recency.AddFirst(existing);
++                    }
++                    else
++                    {
++                        // Least recently used entries sit at the tail: drop idle ones first,
++                        // then evict until there is room.
++                        while (plan.Recency.Last != null && now - plan.Recency.Last.Value.LastUsed >= SlidingMs)
++                        {
++                            plan.Results.Remove(plan.Recency.Last.Value.Key);
++                            plan.Recency.RemoveLast();
++                            Expirations++;
++                        }
++
++                        while (plan.Results.Count >= Capacity)
++                        {
++                            plan.Results.Remove(plan.Recency.Last.Value.Key);
++                            plan.Recency.RemoveLast();
++                            Evictions++;
++                        }
++
++                        plan.Results[key] = plan.Recency.AddFirst(new Entry { Key = key, Indices = indices, LastUsed = now });
++                    }
++                }
++            }
++
++            // Never expose mutable cache storage or stale CustomFormat objects to callers.
++            return Materialize(indices, formats);
++        }
++
++        private static List<CustomFormat> Materialize(int[] indices, List<CustomFormat> formats)
++        {
++            var result = new List<CustomFormat>(indices.Length);
++            foreach (var i in indices)
++            {
++                result.Add(formats[i]);
++            }
++
++            return result;
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/DecisionEngine/DecisionBatchCache.cs b/src/NzbDrone.Core/DecisionEngine/DecisionBatchCache.cs
+new file mode 100644
+index 0000000..47817f6
+--- /dev/null
++++ b/src/NzbDrone.Core/DecisionEngine/DecisionBatchCache.cs
+@@ -0,0 +1,118 @@
++using System;
++using System.Collections.Generic;
++using System.Threading;
++using NzbDrone.Core.Indexers;
++using NzbDrone.Core.Messaging.Events;
++using NzbDrone.Core.ThingiProvider.Events;
++
++namespace NzbDrone.Core.DecisionEngine
++{
++    // Memoizes indexer definitions, which every release in one decision batch loads again
++    // (IndexerTag, RequiredIndexerFlags, AggregateLanguages). The scope covers a single
++    // synchronous GetDecisions enumeration on one thread and is discarded when it ends.
++    //
++    // Every indexer write (add, update, bulk update, delete, bulk delete) goes through
++    // ProviderFactory, which publishes a provider event after the write. Those events bump a
++    // global generation, and a scope drops everything it holds as soon as it sees a new
++    // generation, so a definition changed or deleted mid-batch is re-read exactly as stock
++    // re-reads it. An entry loaded while a write was in flight carries the older generation
++    // and is dropped on the next lookup.
++    //
++    // Only successful, non-null lookups are memoized: Find (null when missing) and Get
++    // (throws ModelNotFoundException when missing) share the key without either seeing the
++    // other's "not found" outcome.
++    internal static class DecisionBatchCache
++    {
++        private static long _generation;
++
++        [ThreadStatic]
++        private static Scope _current;
++
++        internal static long Generation => Interlocked.Read(ref _generation);
++
++        internal static IDisposable Begin()
++        {
++            var scope = new Scope(_current, Generation);
++            _current = scope;
++            return scope;
++        }
++
++        internal static void Invalidate()
++        {
++            Interlocked.Increment(ref _generation);
++        }
++
++        internal static IndexerDefinition Indexer(int id, Func<int, IndexerDefinition> load)
++        {
++            var scope = _current;
++            if (scope == null)
++            {
++                return load(id);
++            }
++
++            // Read the generation before loading: a write that lands during the load bumps
++            // it afterwards, so the entry stored here is discarded on the next lookup.
++            var generation = Generation;
++            if (scope.Generation != generation)
++            {
++                scope.Indexers.Clear();
++                scope.Generation = generation;
++            }
++
++            if (scope.Indexers.TryGetValue(id, out var definition))
++            {
++                return definition;
++            }
++
++            definition = load(id);
++            if (definition != null)
++            {
++                scope.Indexers[id] = definition;
++            }
++
++            return definition;
++        }
++
++        private sealed class Scope : IDisposable
++        {
++            private readonly Scope _previous;
++
++            internal readonly Dictionary<int, IndexerDefinition> Indexers = new Dictionary<int, IndexerDefinition>();
++            internal long Generation;
++
++            internal Scope(Scope previous, long generation)
++            {
++                _previous = previous;
++                Generation = generation;
++            }
++
++            public void Dispose()
++            {
++                if (ReferenceEquals(_current, this))
++                {
++                    _current = _previous;
++                }
++            }
++        }
++    }
++
++    public class DecisionBatchCacheInvalidator : IHandle<ProviderAddedEvent<IIndexer>>,
++                                                 IHandle<ProviderUpdatedEvent<IIndexer>>,
++                                                 IHandle<ProviderDeletedEvent<IIndexer>>
++    {
++        public void Handle(ProviderAddedEvent<IIndexer> message)
++        {
++            DecisionBatchCache.Invalidate();
++        }
++
++        public void Handle(ProviderUpdatedEvent<IIndexer> message)
++        {
++            DecisionBatchCache.Invalidate();
++        }
++
++        public void Handle(ProviderDeletedEvent<IIndexer> message)
++        {
++            DecisionBatchCache.Invalidate();
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/DecisionEngine/DownloadDecisionMaker.cs b/src/NzbDrone.Core/DecisionEngine/DownloadDecisionMaker.cs
+index afa6645..ecd04f7 100644
+--- a/src/NzbDrone.Core/DecisionEngine/DownloadDecisionMaker.cs
++++ b/src/NzbDrone.Core/DecisionEngine/DownloadDecisionMaker.cs
+@@ -64,6 +64,9 @@ private IEnumerable<DownloadDecision> GetDecisions(List<ReleaseInfo> reports, bo
+ 
+             var reportNumber = 1;
+ 
++            // Indexer definitions are shared within this batch only, and dropped on any indexer write.
++            using var batchCache = DecisionBatchCache.Begin();
++
+             foreach (var report in reports)
+             {
+                 DownloadDecision decision = null;
+diff --git a/src/NzbDrone.Core/DecisionEngine/Specifications/RequiredIndexerFlagsSpecification.cs b/src/NzbDrone.Core/DecisionEngine/Specifications/RequiredIndexerFlagsSpecification.cs
+index 8fbff2b..412a53b 100644
+--- a/src/NzbDrone.Core/DecisionEngine/Specifications/RequiredIndexerFlagsSpecification.cs
++++ b/src/NzbDrone.Core/DecisionEngine/Specifications/RequiredIndexerFlagsSpecification.cs
+@@ -27,7 +27,7 @@ public DownloadSpecDecision IsSatisfiedBy(RemoteMovie subject, ReleaseDecisionIn
+             IIndexerSettings indexerSettings = null;
+             try
+             {
+-                indexerSettings = _indexerFactory.Get(subject.Release.IndexerId)?.Settings as IIndexerSettings;
++                indexerSettings = DecisionBatchCache.Indexer(subject.Release.IndexerId, _indexerFactory.Get)?.Settings as IIndexerSettings;
+             }
+             catch (Exception)
+             {
+diff --git a/src/NzbDrone.Core/DecisionEngine/Specifications/RssSync/IndexerTagSpecification.cs b/src/NzbDrone.Core/DecisionEngine/Specifications/RssSync/IndexerTagSpecification.cs
+index 7cc8c74..4a23bca 100644
+--- a/src/NzbDrone.Core/DecisionEngine/Specifications/RssSync/IndexerTagSpecification.cs
++++ b/src/NzbDrone.Core/DecisionEngine/Specifications/RssSync/IndexerTagSpecification.cs
+@@ -31,7 +31,7 @@ public virtual DownloadSpecDecision IsSatisfiedBy(RemoteMovie subject, ReleaseDe
+             IndexerDefinition indexer;
+             try
+             {
+-                indexer = _indexerFactory.Get(subject.Release.IndexerId);
++                indexer = DecisionBatchCache.Indexer(subject.Release.IndexerId, _indexerFactory.Get);
+             }
+             catch (ModelNotFoundException)
+             {
+diff --git a/src/NzbDrone.Core/Download/Aggregation/Aggregators/AggregateLanguages.cs b/src/NzbDrone.Core/Download/Aggregation/Aggregators/AggregateLanguages.cs
+index 0ad220c..710cbf1 100644
+--- a/src/NzbDrone.Core/Download/Aggregation/Aggregators/AggregateLanguages.cs
++++ b/src/NzbDrone.Core/Download/Aggregation/Aggregators/AggregateLanguages.cs
+@@ -77,7 +77,7 @@ public RemoteMovie Aggregate(RemoteMovie remoteMovie)
+ 
+                 if (releaseInfo is { IndexerId: > 0 })
+                 {
+-                    indexer = _indexerFactory.Find(releaseInfo.IndexerId);
++                    indexer = DecisionEngine.DecisionBatchCache.Indexer(releaseInfo.IndexerId, _indexerFactory.Find);
+                 }
+ 
+                 if (indexer == null && releaseInfo.Indexer?.IsNotNullOrWhiteSpace() == true)

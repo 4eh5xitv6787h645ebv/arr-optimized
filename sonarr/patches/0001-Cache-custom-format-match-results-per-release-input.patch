@@ -1,0 +1,409 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sonarr-next <sonarr-next@localhost>
+Date: Tue, 24 Nov 2026 22:53:47 +0800
+Subject: [PATCH 1/4] Cache custom-format match results per release input
+
+---
+ .../CustomFormatCalculationService.cs         |   5 +
+ .../CustomFormats/CustomFormatMatchCache.cs   | 376 ++++++++++++++++++
+ 2 files changed, 381 insertions(+)
+ create mode 100644 src/NzbDrone.Core/CustomFormats/CustomFormatMatchCache.cs
+
+diff --git a/src/NzbDrone.Core/CustomFormats/CustomFormatCalculationService.cs b/src/NzbDrone.Core/CustomFormats/CustomFormatCalculationService.cs
+index 49b1091..e2517f9 100644
+--- a/src/NzbDrone.Core/CustomFormats/CustomFormatCalculationService.cs
++++ b/src/NzbDrone.Core/CustomFormats/CustomFormatCalculationService.cs
+@@ -145,6 +145,11 @@ namespace NzbDrone.Core.CustomFormats
+         }
+ 
+         private static List<CustomFormat> ParseCustomFormat(CustomFormatInput input, List<CustomFormat> allCustomFormats)
++        {
++            return CustomFormatMatchCache.Parse(input, allCustomFormats, EvaluateCustomFormats);
++        }
++
++        private static List<CustomFormat> EvaluateCustomFormats(CustomFormatInput input, List<CustomFormat> allCustomFormats)
+         {
+             var matches = new List<CustomFormat>();
+ 
+diff --git a/src/NzbDrone.Core/CustomFormats/CustomFormatMatchCache.cs b/src/NzbDrone.Core/CustomFormats/CustomFormatMatchCache.cs
+new file mode 100644
+index 0000000..243890b
+--- /dev/null
++++ b/src/NzbDrone.Core/CustomFormats/CustomFormatMatchCache.cs
+@@ -0,0 +1,376 @@
++using System;
++using System.Collections.Concurrent;
++using System.Collections.Generic;
++using System.Globalization;
++using System.Linq;
++using System.Threading;
++using NzbDrone.Core.Languages;
++
++namespace NzbDrone.Core.CustomFormats
++{
++    // Caches which custom formats MATCH a release/file input. Scores and download decisions stay live.
++    // The key holds every value the supported specification types read, and the definition snapshot is
++    // compared on every call, so an entry can never be served for a different input or rule set.
++    // Expiry therefore only bounds memory: entries idle for SlidingLifetimeMs are dropped and every hit
++    // refreshes the entry. At Capacity, idle-expired entries go first, then the least recently used
++    // EvictionBatch entries. Hits are lock-free; inserts and removals are serialized per generation.
++    internal static class CustomFormatMatchCache
++    {
++        internal const int Capacity = 50000;
++        internal const int MaxKeyText = 4096;
++        internal const long SlidingLifetimeMs = 6L * 60 * 60 * 1000;
++        internal const int EvictionBatch = Capacity / 64;
++        internal const long SweepIntervalMs = 60 * 1000;
++        private static readonly object Gate = new object();
++        private static volatile Plan _plan;
++        internal static long Hits;
++        internal static long Misses;
++        internal static long Evictions;
++        internal static long Expirations;
++
++        // Overridable clock (Environment.TickCount64 is monotonic) so tests can exercise expiry.
++        internal static Func<long> Clock = () => Environment.TickCount64;
++
++        private sealed record Key(string Title, string Filename, string Group,
++            int Resolution, int Source, long Size, int Flags,
++            string Languages, int? OriginalLanguage, int ReleaseType, string Culture, bool HasInfo, bool HasOwner);
++
++        private sealed class Entry
++        {
++            internal int[] Indices;
++            internal long LastAccess;
++        }
++
++        private sealed class Format
++        {
++            internal int Id;
++            internal string Name;
++            internal ICustomFormatSpecification[] Specs;
++            internal ICustomFormatSpecification[] References;
++            internal ICustomFormatSpecification[][] Groups;
++        }
++
++        private sealed class Plan
++        {
++            internal Format[] Formats;
++            internal bool OriginalLanguage;
++
++            // One definition generation. Reads are lock-free; every insert or removal holds Writer.
++            internal readonly ConcurrentDictionary<Key, Entry> Results = new ConcurrentDictionary<Key, Entry>();
++            internal readonly object Writer = new object();
++            internal int Count;
++            internal long LastSweep;
++        }
++
++        private static bool Known(ICustomFormatSpecification spec)
++        {
++            var type = spec.GetType();
++            return type == typeof(ReleaseTitleSpecification) ||
++                type == typeof(ReleaseGroupSpecification) ||
++                type == typeof(LanguageSpecification) ||
++                type == typeof(SizeSpecification) ||
++                type == typeof(IndexerFlagSpecification) ||
++                type == typeof(ResolutionSpecification) ||
++                type == typeof(SourceSpecification) ||
++                type == typeof(ReleaseTypeSpecification);
++        }
++
++        private static bool Same(ICustomFormatSpecification a, ICustomFormatSpecification b)
++        {
++            if (a.GetType() != b.GetType() || a.Required != b.Required || a.Negate != b.Negate)
++            {
++                return false;
++            }
++
++            return a switch
++            {
++                RegexSpecificationBase r => r.Value == ((RegexSpecificationBase)b).Value,
++                LanguageSpecification l => l.Value == ((LanguageSpecification)b).Value && l.ExceptLanguage == ((LanguageSpecification)b).ExceptLanguage,
++                SizeSpecification s => s.Min == ((SizeSpecification)b).Min && s.Max == ((SizeSpecification)b).Max,
++                IndexerFlagSpecification i => i.Value == ((IndexerFlagSpecification)b).Value,
++                ResolutionSpecification r => r.Value == ((ResolutionSpecification)b).Value,
++                SourceSpecification s => s.Value == ((SourceSpecification)b).Value,
++                ReleaseTypeSpecification r => r.Value == ((ReleaseTypeSpecification)b).Value,
++                _ => false
++            };
++        }
++
++        private static bool Current(Plan plan, List<CustomFormat> formats)
++        {
++            if (plan == null || plan.Formats.Length != formats.Count)
++            {
++                return false;
++            }
++
++            for (var i = 0; i < formats.Count; i++)
++            {
++                var old = plan.Formats[i];
++                var current = formats[i];
++                if (old.Id != current.Id || old.Name != current.Name || old.Specs.Length != current.Specifications.Count)
++                {
++                    return false;
++                }
++
++                for (var j = 0; j < old.Specs.Length; j++)
++                {
++                    if (!ReferenceEquals(old.References[j], current.Specifications[j]) || !Same(old.Specs[j], current.Specifications[j]))
++                    {
++                        return false;
++                    }
++                }
++            }
++
++            return true;
++        }
++
++        private static Plan Build(List<CustomFormat> formats)
++        {
++            if (formats.Any(f => f.Specifications.Any(s => !Known(s))))
++            {
++                return null;
++            }
++
++            var compiled = formats.Select(f =>
++            {
++                var specs = f.Specifications.Select(s => s.Clone()).ToArray();
++                return new Format
++                {
++                    Id = f.Id,
++                    Name = f.Name,
++                    Specs = specs,
++                    References = f.Specifications.ToArray(),
++                    Groups = specs.GroupBy(s => s.GetType())
++                        .OrderBy(g => typeof(RegexSpecificationBase).IsAssignableFrom(g.Key) ? 1 : 0)
++                        .Select(g => g.ToArray()).ToArray()
++                };
++            }).ToArray();
++
++            return new Plan
++            {
++                OriginalLanguage = formats.Any(f => f.Specifications.Any(s => s is LanguageSpecification l && l.Value == Language.Original.Id)),
++                Formats = compiled
++            };
++        }
++
++        private static Key InputKey(CustomFormatInput input, Plan plan)
++        {
++            var info = input.EpisodeInfo;
++            var quality = info?.Quality?.Quality;
++
++            // LanguageSpecification only substitutes the original language when both EpisodeInfo and Series exist.
++            var original = plan.OriginalLanguage && info != null ? input.Series?.OriginalLanguage?.Id : null;
++            return new Key(info?.ReleaseTitle, input.Filename, info?.ReleaseGroup,
++                quality?.Resolution ?? 0, (int)(quality?.Source ?? 0),
++                input.Size, (int)input.IndexerFlags,
++                input.Languages == null ? null : string.Join(",", input.Languages.Select(l => l == null ? "null" : l.Id.ToString(CultureInfo.InvariantCulture))),
++                original, (int)input.ReleaseType,
++                CultureInfo.CurrentCulture.Name, info != null, input.Series != null);
++        }
++
++        private static bool GroupMatches(ICustomFormatSpecification[] group, CustomFormatInput input)
++        {
++            // Stock: no required condition may fail, and at least one condition must match.
++            var hasRequired = false;
++            foreach (var spec in group)
++            {
++                if (spec.Required)
++                {
++                    hasRequired = true;
++                    if (!spec.IsSatisfiedBy(input))
++                    {
++                        return false;
++                    }
++                }
++            }
++
++            if (hasRequired)
++            {
++                return true;
++            }
++
++            foreach (var spec in group)
++            {
++                if (spec.IsSatisfiedBy(input))
++                {
++                    return true;
++                }
++            }
++
++            return false;
++        }
++
++        private static int[] Calculate(CustomFormatInput input, Plan plan)
++        {
++            var matches = new List<int>();
++            for (var i = 0; i < plan.Formats.Length; i++)
++            {
++                var ok = true;
++                foreach (var group in plan.Formats[i].Groups)
++                {
++                    if (!GroupMatches(group, input))
++                    {
++                        ok = false;
++                        break;
++                    }
++                }
++
++                if (ok)
++                {
++                    matches.Add(i);
++                }
++            }
++
++            // Same stable, culture-sensitive ordering as the stock OrderBy(x => x.Name).
++            return matches.OrderBy(i => plan.Formats[i].Name).ToArray();
++        }
++
++        private static List<CustomFormat> Materialize(int[] indices, List<CustomFormat> formats)
++        {
++            var result = new List<CustomFormat>(indices.Length);
++            foreach (var i in indices)
++            {
++                result.Add(formats[i]);
++            }
++
++            return result;
++        }
++
++        // Caller holds plan.Writer. Drops idle-expired entries so their memory is released.
++        private static KeyValuePair<Key, Entry>[] Sweep(Plan plan, long now)
++        {
++            plan.LastSweep = now;
++            var entries = plan.Results.ToArray();
++            foreach (var pair in entries)
++            {
++                if (now - Volatile.Read(ref pair.Value.LastAccess) >= SlidingLifetimeMs && plan.Results.TryRemove(pair.Key, out _))
++                {
++                    plan.Count--;
++                    Interlocked.Increment(ref Expirations);
++                }
++            }
++
++            return entries;
++        }
++
++        // Caller holds plan.Writer and the cache is full.
++        private static void MakeRoom(Plan plan, long now)
++        {
++            var entries = Sweep(plan, now);
++            if (plan.Count < Capacity)
++            {
++                return;
++            }
++
++            entries = plan.Results.ToArray();
++
++            // Least recently used first.
++            var times = new long[entries.Length];
++            for (var i = 0; i < entries.Length; i++)
++            {
++                times[i] = Volatile.Read(ref entries[i].Value.LastAccess);
++            }
++
++            Array.Sort(times, entries);
++            var removed = 0;
++            for (var i = 0; i < entries.Length && removed < EvictionBatch; i++)
++            {
++                if (plan.Results.TryRemove(entries[i].Key, out _))
++                {
++                    plan.Count--;
++                    removed++;
++                    Interlocked.Increment(ref Evictions);
++                }
++            }
++        }
++
++        internal static List<CustomFormat> Parse(CustomFormatInput input, List<CustomFormat> formats,
++            Func<CustomFormatInput, List<CustomFormat>, List<CustomFormat>> uncached)
++        {
++            // The snapshot comparison reads only immutable plan arrays and the caller's list, so it runs
++            // without a lock; only a changed definition set takes Gate to build the next generation.
++            var plan = _plan;
++            if (!Current(plan, formats))
++            {
++                lock (Gate)
++                {
++                    plan = _plan;
++                    if (!Current(plan, formats))
++                    {
++                        plan = Build(formats);
++                        _plan = plan;
++                    }
++                }
++            }
++
++            if (plan == null)
++            {
++                return uncached(input, formats);
++            }
++
++            var key = InputKey(input, plan);
++
++            // Bound retained text as well as entry count. Oversized metadata is evaluated normally.
++            var cacheable = (key.Title?.Length ?? 0) + (key.Filename?.Length ?? 0) +
++                (key.Group?.Length ?? 0) + (key.Languages?.Length ?? 0) <= MaxKeyText;
++            if (cacheable && plan.Results.TryGetValue(key, out var hit))
++            {
++                var now = Clock();
++                var last = Volatile.Read(ref hit.LastAccess);
++                if (now - last < SlidingLifetimeMs)
++                {
++                    // Sliding expiry: every hit refreshes the entry.
++                    if (now > last)
++                    {
++                        Volatile.Write(ref hit.LastAccess, now);
++                    }
++
++                    Interlocked.Increment(ref Hits);
++                    return Materialize(hit.Indices, formats);
++                }
++
++                lock (plan.Writer)
++                {
++                    if (plan.Results.TryGetValue(key, out var current) && ReferenceEquals(current, hit) &&
++                        now - Volatile.Read(ref hit.LastAccess) >= SlidingLifetimeMs && plan.Results.TryRemove(key, out _))
++                    {
++                        plan.Count--;
++                        Interlocked.Increment(ref Expirations);
++                    }
++                }
++            }
++
++            Interlocked.Increment(ref Misses);
++            var indices = Calculate(input, plan);
++
++            // An in-flight old calculation cannot populate a newer definition generation.
++            if (cacheable && ReferenceEquals(plan, _plan))
++            {
++                lock (plan.Writer)
++                {
++                    var now = Clock();
++                    if (plan.Results.TryGetValue(key, out var existing))
++                    {
++                        Volatile.Write(ref existing.LastAccess, Math.Max(now, Volatile.Read(ref existing.LastAccess)));
++                    }
++                    else
++                    {
++                        if (plan.Count >= Capacity)
++                        {
++                            MakeRoom(plan, now);
++                        }
++                        else if (now - plan.LastSweep >= SweepIntervalMs)
++                        {
++                            Sweep(plan, now);
++                        }
++
++                        plan.Results[key] = new Entry { Indices = indices, LastAccess = now };
++                        plan.Count++;
++                    }
++                }
++            }
++
++            // Never expose mutable cache storage or stale CustomFormat objects to callers.
++            return Materialize(indices, formats);
++        }
++    }
++}

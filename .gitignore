@@ -1,0 +1,12 @@
+artifacts/
+.build/
+bin/
+obj/
+__pycache__/
+sonarr-bin/
+radarr-bin/
+runner-musl/
+*.nettrace
+*.speedscope.json
+*.sqlite3
+*.db

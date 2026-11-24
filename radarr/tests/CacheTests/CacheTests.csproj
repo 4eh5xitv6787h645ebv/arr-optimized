@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Run: see tests/README.md (dotnet run with CoreBin, StockBin and the stock bin probe path)
+    CoreBin:  directory holding the patched Radarr.Core.dll
+    StockBin: the stock linuxserver /app/radarr/bin (dependencies; also passed as the runtime probe path)
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Radarr.Core"><HintPath>$(CoreBin)/Radarr.Core.dll</HintPath></Reference>
+    <Reference Include="Radarr.Common"><HintPath>$(StockBin)/Radarr.Common.dll</HintPath></Reference>
+    <Reference Include="Equ"><HintPath>$(StockBin)/Equ.dll</HintPath></Reference>
+    <Reference Include="NLog"><HintPath>$(StockBin)/NLog.dll</HintPath></Reference>
+    <Reference Include="Newtonsoft.Json"><HintPath>$(StockBin)/Newtonsoft.Json.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>
