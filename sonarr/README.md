@@ -21,9 +21,10 @@ Applied in order by `build.sh` (`git apply`). Each is independent of later ones.
    snapshot is compared on every call. Up to 50,000 entries, 6 h sliding expiry refreshed on every
    hit, least-recently-used batch eviction at the cap, lock-free hits. Scores, profiles and all
    decisions stay live. Unknown condition types bypass the cache.
-2. `0002` **Cache `Database.DatabaseType`.** Every repository query asked for the database type,
-   which opened (and closed) a whole extra SQLite connection per query. The type never changes, so
-   it is now read once.
+2. `0002` **Cache `Database.DatabaseType`.** Reading the type from the raw `Database` opens a
+   connection. In the running app this has no effect: repositories receive `MainDatabase`, which
+   already reads the type once at startup, and ablation runs showed no difference. The patch is
+   harmless and will be dropped at the next rebase.
 3. `0003` **Per-batch read memo (`DecisionScope`).** Within one `GetSearchDecision`/`GetRssDecision`
    call, rows that every release re-reads (indexer definition, release profiles, episode history,
    episodes in a file) are read once. Nothing outside a batch is cached. A memoized lookup is

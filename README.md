@@ -41,8 +41,8 @@ is identical, since the patches don't touch it.
 ## What changes
 
 Both apps re-run the same work for every release in a search: custom-format matching (hundreds of
-regexes per release), repeated database reads of the same rows, and (Sonarr) an extra SQLite
-connection per query. The patches remove that repetition and keep every result live:
+regexes per release) and repeated database reads of the same rows. The patches remove that
+repetition and keep every result live:
 
 - **Custom-format match cache.** Remembers *which* custom formats match a given release input.
   The key holds every value the supported condition types read, definitions are checked on every
@@ -52,9 +52,8 @@ connection per query. The patches remove that repetition and keep every result l
 - **Per-search read memo.** Rows that every release re-reads (indexer, and in Sonarr also release
   profiles, history, blocklist and episode rows) are read once per decision batch and re-read
   after any write to that table, so downloads that finish mid-search are seen exactly as on stock.
-- **Sonarr only:** the database type is read once instead of opening a whole SQLite connection per
-  query, and blocklist title checks within a batch use an in-memory copy of SQLite's own `LIKE`
-  rules (checked against real SQLite with 2.3 million random comparisons, 0 differences).
+- **Sonarr only:** blocklist title checks within a batch use an in-memory copy of SQLite's own
+  `LIKE` rules (checked against real SQLite with 2.3 million random comparisons, 0 differences).
 
 Details, rebase notes and the per-patch risk are in [sonarr/README.md](sonarr/README.md) and
 [radarr/README.md](radarr/README.md).
