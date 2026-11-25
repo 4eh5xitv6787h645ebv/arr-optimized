@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arr-optimized <arr-optimized@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH 10/10] Fixed: Duplicate extra file entries
+
+A tracked -orig extra file row is removed when metadata overwrites the
+tracked file (the file goes to the recycle bin first if it still exists),
+and a daily housekeeper keeps only the newest row per path.
+---
+ .../Extras/Others/OtherExtraFileRenamer.cs    | 14 +++++++----
+ .../CleanupDuplicateExtraFiles.cs             | 25 +++++++++++++++++++
+ 2 files changed, 34 insertions(+), 5 deletions(-)
+ create mode 100644 src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupDuplicateExtraFiles.cs
+
+diff --git a/src/NzbDrone.Core/Extras/Others/OtherExtraFileRenamer.cs b/src/NzbDrone.Core/Extras/Others/OtherExtraFileRenamer.cs
+index c4ec247dfd..a339ff23ac 100644
+--- a/src/NzbDrone.Core/Extras/Others/OtherExtraFileRenamer.cs
++++ b/src/NzbDrone.Core/Extras/Others/OtherExtraFileRenamer.cs
+@@ -60,19 +60,23 @@ public void RenameOtherExtraFile(Series series, string path)
+ 
+         private void RemoveOtherExtraFile(Series series, string path)
+         {
+-            if (!_diskProvider.FileExists(path))
++            var relativePath = series.Path.GetRelativePath(path);
++            var otherExtraFile = _otherExtraFileService.FindByPath(series.Id, relativePath);
++
++            if (otherExtraFile == null)
+             {
+                 return;
+             }
+ 
+-            var relativePath = series.Path.GetRelativePath(path);
+-            var otherExtraFile = _otherExtraFileService.FindByPath(series.Id, relativePath);
+-
+-            if (otherExtraFile != null)
++            // The tracked -orig file may already be gone from disk (e.g. deleted before the next rescan).
++            // Drop its row anyway, otherwise the row renamed to this path becomes a duplicate.
++            if (_diskProvider.FileExists(path))
+             {
+                 var subfolder = Path.GetDirectoryName(relativePath);
+                 _recycleBinProvider.DeleteFile(path, subfolder);
+             }
++
++            _otherExtraFileService.Delete(otherExtraFile.Id);
+         }
+     }
+ }
+diff --git a/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupDuplicateExtraFiles.cs b/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupDuplicateExtraFiles.cs
+new file mode 100644
+index 0000000000..85b35554a1
+--- /dev/null
++++ b/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupDuplicateExtraFiles.cs
+@@ -0,0 +1,25 @@
++using Dapper;
++using NzbDrone.Core.Datastore;
++
++namespace NzbDrone.Core.Housekeeping.Housekeepers
++{
++    public class CleanupDuplicateExtraFiles : IHousekeepingTask
++    {
++        private readonly IMainDatabase _database;
++
++        public CleanupDuplicateExtraFiles(IMainDatabase database)
++        {
++            _database = database;
++        }
++
++        public void Clean()
++        {
++            using var mapper = _database.OpenConnection();
++            mapper.Execute(@"DELETE FROM ""ExtraFiles""
++                                     WHERE ""Id"" NOT IN (
++                                         SELECT MAX(""Id"") FROM ""ExtraFiles""
++                                         GROUP BY ""SeriesId"", ""RelativePath""
++                                     )");
++        }
++    }
++}

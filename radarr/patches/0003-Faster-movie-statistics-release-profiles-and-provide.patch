@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arr-optimized <arr-optimized@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH 3/8] Faster movie statistics, release profiles and provider
+ settings lookup
+
+- Movie statistics join file statistics through a dictionary instead of a
+  linear search per movie.
+- Release profiles are cached in memory and cleared on every add, update
+  and delete.
+- The provider settings type is looked up once per type name instead of
+  scanning every exported type of Radarr.Core per row.
+---
+ .../MovieStats/MovieStatisticsRepository.cs   |  5 +-
+ .../Releases/ReleaseProfileService.cs         | 50 ++++++++++++++++---
+ .../ThingiProvider/ProviderRepository.cs      |  6 ++-
+ 3 files changed, 52 insertions(+), 9 deletions(-)
+
+diff --git a/src/NzbDrone.Core/MovieStats/MovieStatisticsRepository.cs b/src/NzbDrone.Core/MovieStats/MovieStatisticsRepository.cs
+index 441e701ce..004bb4479 100644
+--- a/src/NzbDrone.Core/MovieStats/MovieStatisticsRepository.cs
++++ b/src/NzbDrone.Core/MovieStats/MovieStatisticsRepository.cs
+@@ -39,9 +39,12 @@ public List<MovieStatistics> MovieStatistics(int movieId)
+ 
+         private List<MovieStatistics> MapResults(List<MovieStatistics> moviesResult, List<MovieStatistics> filesResult)
+         {
++            // Both queries group by MovieId, so each movie has at most one files row.
++            var filesByMovieId = filesResult.ToDictionary(f => f.MovieId);
++
+             moviesResult.ForEach(e =>
+             {
+-                var file = filesResult.SingleOrDefault(f => f.MovieId == e.MovieId);
++                filesByMovieId.TryGetValue(e.MovieId, out var file);
+ 
+                 e.SizeOnDisk = file?.SizeOnDisk ?? 0;
+                 e.ReleaseGroupsString = file?.ReleaseGroupsString;
+diff --git a/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs b/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
+index 890170054..1e25c5ef1 100644
+--- a/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
++++ b/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
+@@ -22,6 +22,10 @@ public class ReleaseProfileService : IReleaseProfileService
+         private readonly IReleaseProfileRepository _repo;
+         private readonly Logger _logger;
+ 
++        // The decision engine reads the profiles for every release; they change only through this service.
++        private readonly object _profilesLock = new();
++        private List<ReleaseProfile> _profiles;
++
+         public ReleaseProfileService(IReleaseProfileRepository repo, Logger logger)
+         {
+             _repo = repo;
+@@ -30,19 +34,22 @@ public ReleaseProfileService(IReleaseProfileRepository repo, Logger logger)
+ 
+         public List<ReleaseProfile> All()
+         {
+-            var all = _repo.All().ToList();
++            lock (_profilesLock)
++            {
++                _profiles ??= _repo.All().ToList();
+ 
+-            return all;
++                return _profiles.ToList();
++            }
+         }
+ 
+         public List<ReleaseProfile> AllForTag(int tagId)
+         {
+-            return _repo.All().Where(r => r.Tags.Contains(tagId)).ToList();
++            return All().Where(r => r.Tags.Contains(tagId)).ToList();
+         }
+ 
+         public List<ReleaseProfile> AllForTags(HashSet<int> tagIds)
+         {
+-            return _repo.All().Where(r => r.Tags.Intersect(tagIds).Any() || r.Tags.Empty()).ToList();
++            return All().Where(r => r.Tags.Intersect(tagIds).Any() || r.Tags.Empty()).ToList();
+         }
+ 
+         public List<ReleaseProfile> EnabledForTags(HashSet<int> tagIds, int indexerId)
+@@ -59,17 +66,46 @@ public ReleaseProfile Get(int id)
+ 
+         public void Delete(int id)
+         {
+-            _repo.Delete(id);
++            try
++            {
++                _repo.Delete(id);
++            }
++            finally
++            {
++                ClearProfiles();
++            }
+         }
+ 
+         public ReleaseProfile Add(ReleaseProfile restriction)
+         {
+-            return _repo.Insert(restriction);
++            try
++            {
++                return _repo.Insert(restriction);
++            }
++            finally
++            {
++                ClearProfiles();
++            }
+         }
+ 
+         public ReleaseProfile Update(ReleaseProfile restriction)
+         {
+-            return _repo.Update(restriction);
++            try
++            {
++                return _repo.Update(restriction);
++            }
++            finally
++            {
++                ClearProfiles();
++            }
++        }
++
++        private void ClearProfiles()
++        {
++            lock (_profilesLock)
++            {
++                _profiles = null;
++            }
+         }
+     }
+ }
+diff --git a/src/NzbDrone.Core/ThingiProvider/ProviderRepository.cs b/src/NzbDrone.Core/ThingiProvider/ProviderRepository.cs
+index 44000f8d3..843020af8 100644
+--- a/src/NzbDrone.Core/ThingiProvider/ProviderRepository.cs
++++ b/src/NzbDrone.Core/ThingiProvider/ProviderRepository.cs
+@@ -1,3 +1,5 @@
++using System;
++using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.Text.Json;
+ using System.Text.Json.Serialization;
+@@ -13,6 +15,8 @@ namespace NzbDrone.Core.ThingiProvider
+     public class ProviderRepository<TProviderDefinition> : BasicRepository<TProviderDefinition>, IProviderRepository<TProviderDefinition>
+         where TProviderDefinition : ProviderDefinition, new()
+     {
++        // The assembly's exported types never change at runtime; FindTypeByName scans all of them per row.
++        private static readonly ConcurrentDictionary<string, Type> ConfigTypes = new ConcurrentDictionary<string, Type>();
+         protected readonly JsonSerializerOptions _serializerSettings;
+ 
+         protected ProviderRepository(IMainDatabase database, IEventAggregator eventAggregator)
+@@ -52,7 +56,7 @@ protected override List<TProviderDefinition> Query(SqlBuilder builder)
+                 {
+                     var body = reader.IsDBNull(settingsIndex) ? null : reader.GetString(settingsIndex);
+                     var item = parser(reader);
+-                    var impType = typeof(IProviderConfig).Assembly.FindTypeByName(item.ConfigContract);
++                    var impType = ConfigTypes.GetOrAdd(item.ConfigContract ?? string.Empty, name => typeof(IProviderConfig).Assembly.FindTypeByName(name));
+ 
+                     if (body.IsNullOrWhiteSpace() || impType == null)
+                     {

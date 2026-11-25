@@ -1,0 +1,476 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arr-optimized <arr-optimized@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH 4/8] Cache ffprobe results per file and stop hung ffprobe runs
+
+Results are reused only while the file stamp (size, last write time and,
+for a symlink, the final target path and its last write time) is unchanged
+before and after the probe. The cache is bounded by entry count and by
+estimated memory. A probe that runs longer than 5 minutes returns no media
+info instead of blocking the import forever.
+---
+ .../MediaInfo/MediaInfoProbeCache.cs          | 318 ++++++++++++++++++
+ .../MediaInfo/VideoFileInfoReader.cs          |  89 ++++-
+ 2 files changed, 403 insertions(+), 4 deletions(-)
+ create mode 100644 src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs
+
+diff --git a/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs b/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs
+new file mode 100644
+index 000000000..f8217a531
+--- /dev/null
++++ b/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs
+@@ -0,0 +1,318 @@
++using System;
++using System.Collections.Concurrent;
++using System.Collections.Generic;
++using System.Linq;
++using System.Reflection;
++using System.Threading;
++
++namespace NzbDrone.Core.MediaFiles.MediaInfo
++{
++    // Remembers ffprobe results per file, so an unchanged file is not probed again when it is looked at
++    // repeatedly (blocked queue items are re-imported every minute, sample detection and aggregation probe
++    // the same file during one import, manual import previews). An entry is used only while the path and the
++    // file stamp (size, last write time and, for a symlink, the last write time of its final target) are
++    // exactly those seen before and after the probe. Callers get their own copy of the model, never the
++    // cached instance.
++    internal sealed class MediaInfoProbeCache
++    {
++        internal const int Capacity = 1000;
++        internal const int EvictionBatch = Capacity / 10;
++
++        // Bound on the estimated memory of all entries. RawStreamData (the full ffprobe JSON) dominates an
++        // entry: about 5 KB for a typical WEB-DL, but 100+ KB for an mkv with many font attachments.
++        internal const long MaxBytes = 32L * 1024 * 1024;
++
++        // Larger results are not cached at all.
++        internal const long MaxEntryBytes = MaxBytes / 8;
++
++        // Entries not used for this long are dropped.
++        internal const long IdleLifetimeMs = 6L * 60 * 60 * 1000;
++
++        // A failed probe is retried after this long even if the file did not change.
++        internal const long FailureLifetimeMs = 10L * 60 * 1000;
++
++        // A file written less than SettleTime before the probe started may still be changing within the
++        // timestamp resolution of its file system: a success is reused only briefly (enough for one import
++        // pass) and a failure is not remembered at all.
++        internal static readonly TimeSpan SettleTime = TimeSpan.FromSeconds(60);
++        internal const long UnsettledLifetimeMs = 60 * 1000;
++
++        internal const long SweepIntervalMs = 60 * 1000;
++
++        // Test hooks.
++        internal static Func<long> Clock = () => Environment.TickCount64;
++        internal static Func<DateTime> UtcNow = () => DateTime.UtcNow;
++
++        private static readonly Func<object, object> MemberwiseCloneFunc = (Func<object, object>)Delegate.CreateDelegate(
++            typeof(Func<object, object>),
++            typeof(object).GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic));
++
++        private readonly ConcurrentDictionary<string, Entry> _entries = new ConcurrentDictionary<string, Entry>(StringComparer.Ordinal);
++
++        // Every change of _entries and _bytes happens under this lock; lookups do not take it.
++        private readonly object _writer = new object();
++        private long _bytes;
++        private long _lastSweep;
++
++        internal long Hits;
++        internal long Misses;
++        internal long Stores;
++
++        internal readonly struct FileStamp : IEquatable<FileStamp>
++        {
++            public FileStamp(long length, DateTime lastWrite, DateTime targetLastWrite = default, string targetPath = null)
++            {
++                Length = length;
++                LastWrite = lastWrite;
++                TargetLastWrite = targetLastWrite;
++                TargetPath = targetPath;
++            }
++
++            public long Length { get; }
++
++            // Last write time of the path itself (for a symlink: of the link).
++            public DateTime LastWrite { get; }
++
++            // For a symlink: last write time of its final target, otherwise default.
++            public DateTime TargetLastWrite { get; }
++
++            // For a symlink: full path of its final target, otherwise null. Re-pointing any link in a chain changes it.
++            public string TargetPath { get; }
++
++            public DateTime NewestWrite => TargetLastWrite > LastWrite ? TargetLastWrite : LastWrite;
++
++            public bool Equals(FileStamp other)
++            {
++                return Length == other.Length && LastWrite == other.LastWrite && TargetLastWrite == other.TargetLastWrite &&
++                       string.Equals(TargetPath, other.TargetPath, StringComparison.Ordinal);
++            }
++
++            public override bool Equals(object obj)
++            {
++                return obj is FileStamp other && Equals(other);
++            }
++
++            public override int GetHashCode()
++            {
++                return HashCode.Combine(Length, LastWrite, TargetLastWrite, TargetPath == null ? 0 : StringComparer.Ordinal.GetHashCode(TargetPath));
++            }
++        }
++
++        private sealed class Entry
++        {
++            public FileStamp Stamp;
++            public MediaInfoModel Model;
++            public long Size;
++            public long ExpiresAt;
++            public long LastAccess;
++        }
++
++        internal int Count => _entries.Count;
++
++        internal long Bytes => Volatile.Read(ref _bytes);
++
++        internal bool TryGet(string path, long length, DateTime lastWrite, out MediaInfoModel model)
++        {
++            return TryGet(path, new FileStamp(length, lastWrite), out model);
++        }
++
++        internal bool TryGet(string path, FileStamp stamp, out MediaInfoModel model)
++        {
++            model = null;
++            var now = Clock();
++
++            if (_entries.TryGetValue(path, out var entry))
++            {
++                if (entry.Stamp.Equals(stamp) &&
++                    now < entry.ExpiresAt &&
++                    now - Volatile.Read(ref entry.LastAccess) < IdleLifetimeMs)
++                {
++                    Volatile.Write(ref entry.LastAccess, now);
++                    Interlocked.Increment(ref Hits);
++                    model = Copy(entry.Model);
++
++                    SweepIfDue(now);
++
++                    return true;
++                }
++
++                lock (_writer)
++                {
++                    Remove(path, entry);
++                }
++            }
++
++            Interlocked.Increment(ref Misses);
++
++            SweepIfDue(now);
++
++            return false;
++        }
++
++        internal void Add(string path, long length, DateTime lastWrite, MediaInfoModel model)
++        {
++            Add(path, new FileStamp(length, lastWrite), model, UtcNow());
++        }
++
++        // probeStartedUtc: when the probe whose result this is started; the settle rule is judged at that time.
++        internal void Add(string path, FileStamp stamp, MediaInfoModel model, DateTime probeStartedUtc)
++        {
++            var now = Clock();
++            var settled = probeStartedUtc - stamp.NewestWrite >= SettleTime;
++
++            long expiresAt;
++
++            if (model == null)
++            {
++                if (!settled)
++                {
++                    return;
++                }
++
++                expiresAt = now + FailureLifetimeMs;
++            }
++            else
++            {
++                expiresAt = settled ? long.MaxValue : now + UnsettledLifetimeMs;
++            }
++
++            var size = EstimateSize(model);
++
++            lock (_writer)
++            {
++                if (_entries.TryGetValue(path, out var old))
++                {
++                    Remove(path, old);
++                }
++
++                if (size > MaxEntryBytes)
++                {
++                    return;
++                }
++
++                _entries[path] = new Entry
++                {
++                    Stamp = stamp,
++                    Model = Copy(model),
++                    Size = size,
++                    ExpiresAt = expiresAt,
++                    LastAccess = now
++                };
++
++                _bytes += size;
++
++                Interlocked.Increment(ref Stores);
++
++                if (_entries.Count > Capacity || _bytes > MaxBytes || now - _lastSweep >= SweepIntervalMs)
++                {
++                    Trim(now);
++                }
++            }
++        }
++
++        internal void Clear()
++        {
++            lock (_writer)
++            {
++                _entries.Clear();
++                _bytes = 0;
++            }
++        }
++
++        // Rough managed size of a cached entry: the strings (UTF-16) dominate, plus object overhead.
++        internal static long EstimateSize(MediaInfoModel model)
++        {
++            if (model == null)
++            {
++                return 256;
++            }
++
++            var chars = (model.RawStreamData?.Length ?? 0) + (model.Title?.Length ?? 0);
++            var streams = (model.AudioStreams?.Count ?? 0) + (model.SubtitleStreams?.Count ?? 0);
++
++            return 1024 + (2L * chars) + (256L * streams);
++        }
++
++        private void SweepIfDue(long now)
++        {
++            if (now - Volatile.Read(ref _lastSweep) < SweepIntervalMs || !Monitor.TryEnter(_writer))
++            {
++                return;
++            }
++
++            try
++            {
++                Trim(now);
++            }
++            finally
++            {
++                Monitor.Exit(_writer);
++            }
++        }
++
++        // Caller holds _writer.
++        private void Remove(string path, Entry entry)
++        {
++            if (_entries.TryRemove(new KeyValuePair<string, Entry>(path, entry)))
++            {
++                _bytes -= entry.Size;
++            }
++        }
++
++        // Caller holds _writer.
++        private void Trim(long now)
++        {
++            Volatile.Write(ref _lastSweep, now);
++
++            foreach (var pair in _entries)
++            {
++                if (now >= pair.Value.ExpiresAt || now - Volatile.Read(ref pair.Value.LastAccess) >= IdleLifetimeMs)
++                {
++                    Remove(pair.Key, pair.Value);
++                }
++            }
++
++            if (_entries.Count <= Capacity && _bytes <= MaxBytes)
++            {
++                return;
++            }
++
++            // Over a bound: drop the least recently used entries until a tenth of the room is free again.
++            var victims = _entries
++                .OrderBy(pair => Volatile.Read(ref pair.Value.LastAccess))
++                .ToList();
++
++            foreach (var pair in victims)
++            {
++                if (_entries.Count <= Capacity - EvictionBatch && _bytes <= MaxBytes - (MaxBytes / 10))
++                {
++                    break;
++                }
++
++                Remove(pair.Key, pair.Value);
++            }
++        }
++
++        // Every MediaInfoModel member is an immutable value (string, number, enum, TimeSpan) except the two
++        // stream lists, whose items have only immutable members, so this copy shares no mutable state.
++        internal static MediaInfoModel Copy(MediaInfoModel model)
++        {
++            if (model == null)
++            {
++                return null;
++            }
++
++            var copy = (MediaInfoModel)MemberwiseCloneFunc(model);
++            copy.AudioStreams = model.AudioStreams?.Select(ShallowCopy).ToList();
++            copy.SubtitleStreams = model.SubtitleStreams?.Select(ShallowCopy).ToList();
++
++            return copy;
++        }
++
++        private static T ShallowCopy<T>(T item)
++            where T : class
++        {
++            return item == null ? null : (T)MemberwiseCloneFunc(item);
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs b/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs
+index 0e6305fd9..529667ad1 100644
+--- a/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs
++++ b/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs
+@@ -3,6 +3,7 @@
+ using System.IO;
+ using System.Linq;
+ using System.Text.Json.Nodes;
++using System.Threading;
+ using FFMpegCore;
+ using NLog;
+ using NzbDrone.Common.Disk;
+@@ -29,6 +30,11 @@ public class VideoFileInfoReader : IVideoFileInfoReader
+         private static readonly string[] PqTransferFunctions = { "smpte2084" };
+         private static readonly string[] ValidHdrTransferFunctions = HlgTransferFunctions.Concat(PqTransferFunctions).ToArray();
+ 
++        // One budget for all ffprobe runs of a single probe, so a hung ffprobe cannot block the command thread forever.
++        internal static TimeSpan ProbeTimeout { get; set; } = TimeSpan.FromMinutes(5);
++
++        private readonly MediaInfoProbeCache _probeCache = new MediaInfoProbeCache();
++
+         public VideoFileInfoReader(IDiskProvider diskProvider, Logger logger)
+         {
+             _diskProvider = diskProvider;
+@@ -52,17 +58,88 @@ public MediaInfoModel GetMediaInfo(string filename)
+                 return null;
+             }
+ 
+-            // TODO: Cache media info by path, mtime and length so we don't need to read files multiple times
++            if (!TryGetFileStamp(filename, out var stamp))
++            {
++                return ProbeMediaInfo(filename);
++            }
++
++            if (_probeCache.TryGet(filename, stamp, out var cachedMediaInfo))
++            {
++                _logger.Trace("Using cached media info for {0}", filename);
++
++                return cachedMediaInfo;
++            }
++
++            var probeStarted = MediaInfoProbeCache.UtcNow();
++            var mediaInfo = ProbeMediaInfo(filename);
++
++            // Remember the result only if the file did not change while it was probed
++            if (TryGetFileStamp(filename, out var stampAfter) && stampAfter.Equals(stamp))
++            {
++                _probeCache.Add(filename, stamp, mediaInfo, probeStarted);
++            }
++
++            return mediaInfo;
++        }
++
++        private bool TryGetFileStamp(string filename, out MediaInfoProbeCache.FileStamp stamp)
++        {
++            try
++            {
++                var length = _diskProvider.GetFileSize(filename);
++                var lastWrite = _diskProvider.FileGetLastWrite(filename);
++                var targetLastWrite = default(DateTime);
++                string targetPath = null;
++
++                // For a symlink the size above is the target's, but the last write time is the link's own, which
++                // does not change when the target is rewritten. Add the final target's last write time.
++                var info = new FileInfo(filename);
++
++                if (info.LinkTarget != null)
++                {
++                    var target = info.ResolveLinkTarget(true) as FileInfo;
++
++                    if (target == null || !target.Exists)
++                    {
++                        _logger.Trace("Unable to resolve the target of symlink {0}, not using the media info cache", filename);
++
++                        stamp = default;
++
++                        return false;
++                    }
++
++                    targetLastWrite = target.LastWriteTimeUtc;
++                    targetPath = target.FullName;
++                }
++
++                stamp = new MediaInfoProbeCache.FileStamp(length, lastWrite, targetLastWrite, targetPath);
++
++                return true;
++            }
++            catch (Exception ex)
++            {
++                _logger.Trace(ex, "Unable to read size and last write time of {0}, not using the media info cache", filename);
++
++                stamp = default;
++
++                return false;
++            }
++        }
++
++        private MediaInfoModel ProbeMediaInfo(string filename)
++        {
+             try
+             {
+                 _logger.Debug("Getting media info from {0}", filename);
+ 
+-                var analysis = FFProbe.Analyse(filename, customArguments: "-probesize 50000000");
++                using var cts = new CancellationTokenSource(ProbeTimeout);
++
++                var analysis = FFProbe.AnalyseAsync(filename, customArguments: "-probesize 50000000", cancellationToken: cts.Token).GetAwaiter().GetResult();
+                 var primaryVideoStream = GetPrimaryVideoStream(analysis);
+ 
+                 if (analysis.PrimaryAudioStream?.ChannelLayout.IsNullOrWhiteSpace() ?? true)
+                 {
+-                    analysis = FFProbe.Analyse(filename, customArguments: "-probesize 150000000 -analyzeduration 150000000");
++                    analysis = FFProbe.AnalyseAsync(filename, customArguments: "-probesize 150000000 -analyzeduration 150000000", cancellationToken: cts.Token).GetAwaiter().GetResult();
+                 }
+ 
+                 var mediaInfoModel = new MediaInfoModel();
+@@ -161,7 +238,7 @@ public MediaInfoModel GetMediaInfo(string filename)
+                 if (PqTransferFunctions.Contains(mediaInfoModel.VideoTransferCharacteristics))
+                 {
+                     var videoStreamIndex = analysis.VideoStreams.ToList().FindIndex(stream => stream.Index == primaryVideoStream?.Index);
+-                    frames = FFProbe.GetFrames(filename, customArguments: $"-read_intervals \"%+#1\" -select_streams v:{(videoStreamIndex == -1 ? 0 : videoStreamIndex)}");
++                    frames = FFProbe.GetFramesAsync(filename, customArguments: $"-read_intervals \"%+#1\" -select_streams v:{(videoStreamIndex == -1 ? 0 : videoStreamIndex)}", cancellationToken: cts.Token).GetAwaiter().GetResult();
+                 }
+ 
+                 var streamSideData = primaryVideoStream?.SideData ?? new List<IReadOnlyDictionary<string, JsonNode>>().AsReadOnly();
+@@ -172,6 +249,10 @@ public MediaInfoModel GetMediaInfo(string filename)
+ 
+                 return mediaInfoModel;
+             }
++            catch (OperationCanceledException)
++            {
++                _logger.Error("ffprobe did not finish within {0} and was stopped, unable to parse media info from file: {1}", ProbeTimeout, filename);
++            }
+             catch (Exception ex)
+             {
+                 _logger.Error(ex, "Unable to parse media info from file: {0}", filename);

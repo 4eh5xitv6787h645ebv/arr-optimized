@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arr-optimized <arr-optimized@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH 6/8] Give each Scheduler its own timer so in-process restarts
+ do not stack handlers
+
+---
+ src/NzbDrone.Core/Jobs/Scheduler.cs | 63 +++++++++++++++++++++++------
+ 1 file changed, 50 insertions(+), 13 deletions(-)
+
+diff --git a/src/NzbDrone.Core/Jobs/Scheduler.cs b/src/NzbDrone.Core/Jobs/Scheduler.cs
+index 54e243467..5a8a42811 100644
+--- a/src/NzbDrone.Core/Jobs/Scheduler.cs
++++ b/src/NzbDrone.Core/Jobs/Scheduler.cs
+@@ -17,8 +17,13 @@ public class Scheduler :
+         private readonly ITaskManager _taskManager;
+         private readonly IManageCommandQueue _commandQueueManager;
+         private readonly Logger _logger;
+-        private static readonly Timer Timer = new Timer();
+-        private static CancellationTokenSource _cancellationTokenSource;
++
++        // The timer and its cancellation source belong to this instance (one per host). They used to be static, so every
++        // in-process restart (a new host in the same process) added another Elapsed handler to the same timer, and the
++        // handlers of earlier hosts kept running against their stale TaskManager and CommandQueueManager.
++        private readonly object _timerLock = new object();
++        private Timer _timer;
++        private CancellationTokenSource _cancellationTokenSource;
+ 
+         public Scheduler(ITaskManager taskManager, IManageCommandQueue commandQueueManager, Logger logger)
+         {
+@@ -27,11 +32,14 @@ public Scheduler(ITaskManager taskManager, IManageCommandQueue commandQueueManag
+             _logger = logger;
+         }
+ 
+-        private void ExecuteCommands()
++        private void ExecuteCommands(Timer timer, CancellationToken cancellationToken)
+         {
+             try
+             {
+-                Timer.Enabled = false;
++                lock (_timerLock)
++                {
++                    timer.Enabled = false;
++                }
+ 
+                 var tasks = _taskManager.GetPending().ToList();
+ 
+@@ -44,28 +52,57 @@ private void ExecuteCommands()
+             }
+             finally
+             {
+-                if (!_cancellationTokenSource.IsCancellationRequested)
++                // Cancellation always happens before the timer is disposed, and both happen under this lock,
++                // so a cancelled or disposed timer is never re-enabled.
++                lock (_timerLock)
+                 {
+-                    Timer.Enabled = true;
++                    if (!cancellationToken.IsCancellationRequested)
++                    {
++                        timer.Enabled = true;
++                    }
+                 }
+             }
+         }
+ 
+         public void Handle(ApplicationStartedEvent message)
+         {
+-            _cancellationTokenSource = new CancellationTokenSource();
+-            Timer.Interval = 1000 * 30;
+-            Timer.Elapsed += (o, args) => Task.Factory.StartNew(ExecuteCommands, _cancellationTokenSource.Token)
+-                .LogExceptions();
++            lock (_timerLock)
++            {
++                StopTimer();
++
++                var cancellationTokenSource = new CancellationTokenSource();
++                var timer = new Timer(1000 * 30);
+ 
+-            Timer.Start();
++                timer.Elapsed += (o, args) => Task.Factory.StartNew(() => ExecuteCommands(timer, cancellationTokenSource.Token), cancellationTokenSource.Token)
++                    .LogExceptions();
++
++                _cancellationTokenSource = cancellationTokenSource;
++                _timer = timer;
++
++                timer.Start();
++            }
+         }
+ 
+         public void Handle(ApplicationShutdownRequested message)
+         {
+             _logger.Info("Shutting down scheduler");
+-            _cancellationTokenSource.Cancel(true);
+-            Timer.Stop();
++
++            lock (_timerLock)
++            {
++                StopTimer();
++            }
++        }
++
++        private void StopTimer()
++        {
++            _cancellationTokenSource?.Cancel(true);
++
++            if (_timer != null)
++            {
++                _timer.Stop();
++                _timer.Dispose();
++                _timer = null;
++            }
+         }
+     }
+ }

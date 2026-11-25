@@ -24,8 +24,9 @@ against a port of the original 6.0.4 patch it fails the truth table and the year
 
 ## Upstream NUnit fixtures (`UpstreamFixtures/`)
 
-Regression tests for the review findings, written against upstream's own test framework. Copy
-them into the patched tree's `src/NzbDrone.Core.Test/ReviewFixes/` and run:
+Regression tests for the review findings on `0001-radarr-core.patch`, written against upstream's own
+test framework. Copy the `*.cs` files at the top of `UpstreamFixtures/` into the patched tree's
+`src/NzbDrone.Core.Test/ReviewFixes/` and run:
 
 ```
 dotnet test src/NzbDrone.Core.Test/Radarr.Core.Test.csproj -c Debug -f net10.0 \
@@ -40,3 +41,40 @@ dotnet test src/NzbDrone.Core.Test/Radarr.Core.Test.csproj -c Debug -f net10.0 \
 | `R2OverlapFixture` (re-review) | every release is decided after the last indexer answers | pass | fail on `0263cf9d` (fast batch decided before the write) | pass |
 
 They compile against stock and older builds too: the batch-memo pieces are resolved by name.
+
+### Fixtures for patches 0002–0008
+
+Each folder below mirrors upstream's `src/` folder, so it is copied over the build tree as is.
+
+| Folder | Patch | Fixtures |
+|---|---|---|
+| `RateLimit` | 0002 | `IndexerTests/RateLimitTests/*` (options parsing, the cache-hit refund under threads and a fixed clock, `HttpIndexerBase` and TorrentPotato wiring, real-HTTP timing of searches, grabs and redirects) and `NzbDrone.Host.Test/IndexerRateLimitContainerFixture.cs` (container wiring) |
+| `Perf` | 0003 | `PerfNext/*`: statistics equal stock's; the release-profile cache is cleared on every write and a load that overlaps a write never keeps old rows; the settings-type cache is used |
+| `FFprobe` | 0004 | `MediaFiles/MediaInfo/*` and the four small sample files in `Files/Media` (`make-media.sh` regenerates them). Uses the ffprobe upstream's test project already ships; the timeout tests also need `/bin/sh`, `mkfifo` and `/proc`. The symlink and timeout tests are skipped on Windows |
+| `Imports` | 0005 | `ImportFixes/*`: a throwing import is retried; a lost movie link is completed from import results or history |
+| `Scheduler` | 0006 | `JobTests/SchedulerFixture.cs`; `SchedulerRestartMeasurement.cs` is `[Explicit]` (measurement only) |
+| `Extras` | 0007 | `Extras/Others/*`, `Housekeeping/*` |
+| `RadarrDb` | 0008 | `Messaging/Commands/HousekeepingCommandQueueFixture.cs`, `BackupTests/*`, `Datastore/DatabaseRestorationServiceFixture.cs` |
+
+```sh
+for g in RateLimit Perf FFprobe Imports Scheduler Extras RadarrDb; do cp -r tests/UpstreamFixtures/$g/. <tree>/src/; done
+cd <tree>
+dotnet build src/NzbDrone.Core.Test/Radarr.Core.Test.csproj -c Release -p:EnableAnalyzers=false -p:TreatWarningsAsErrors=false
+dotnet test _tests/net10.0/Radarr.Core.Test.dll --filter "FullyQualifiedName~RateLimitTests|FullyQualifiedName~PerfNext|FullyQualifiedName~MediaFiles.MediaInfo|FullyQualifiedName~ImportFixes|FullyQualifiedName~JobTests.SchedulerFixture|FullyQualifiedName~OtherExtraFileRenamer|FullyQualifiedName~DuplicateExtraFiles|FullyQualifiedName~BackupTests|FullyQualifiedName~DatabaseRestorationServiceFixture|FullyQualifiedName~HousekeepingCommandQueueFixture"
+```
+
+`[Category("PerfNextBenchmark")]` tests are `[Explicit]` timings, not checks. To run the database
+fixtures against PostgreSQL, set `Radarr__Postgres__Host`, `__Port`, `__User` and `__Password`.
+
+The container fixture needs the Host test project and `Radarr.Mono.dll` next to it:
+
+```sh
+dotnet build src/NzbDrone.Mono/Radarr.Mono.csproj -c Release -p:EnableAnalyzers=false
+dotnet build src/NzbDrone.Host.Test/Radarr.Host.Test.csproj -c Release -p:EnableAnalyzers=false -p:TreatWarningsAsErrors=false
+cp _output/net10.0/Radarr.Mono.dll _tests/net10.0/
+dotnet test _tests/net10.0/Radarr.Host.Test.dll
+```
+
+Some fixtures only compile on a patched tree, because they use the new types
+(`IndexerRateLimitOptions`, `IndexerCacheHitRateLimiter`, `MediaInfoProbeCache`). The others
+compile on stock too, which is how the regression tests were shown to fail there.

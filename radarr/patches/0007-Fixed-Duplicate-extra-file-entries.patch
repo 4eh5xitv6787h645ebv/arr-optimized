@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arr-optimized <arr-optimized@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH 7/8] Fixed: Duplicate extra file entries
+
+A tracked -orig extra file row is removed when metadata overwrites the
+tracked file (the file goes to the recycle bin first if it still exists),
+and a daily housekeeper keeps only the newest row per path.
+---
+ .../Extras/Others/OtherExtraFileRenamer.cs    | 14 +++++++----
+ .../CleanupDuplicateExtraFiles.cs             | 25 +++++++++++++++++++
+ 2 files changed, 34 insertions(+), 5 deletions(-)
+ create mode 100644 src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupDuplicateExtraFiles.cs
+
+diff --git a/src/NzbDrone.Core/Extras/Others/OtherExtraFileRenamer.cs b/src/NzbDrone.Core/Extras/Others/OtherExtraFileRenamer.cs
+index 9c3e4a92f..dd2f381c4 100644
+--- a/src/NzbDrone.Core/Extras/Others/OtherExtraFileRenamer.cs
++++ b/src/NzbDrone.Core/Extras/Others/OtherExtraFileRenamer.cs
+@@ -56,18 +56,22 @@ public void RenameOtherExtraFile(Movie movie, string path)
+ 
+         private void RemoveOtherExtraFile(Movie movie, string path)
+         {
+-            if (!_diskProvider.FileExists(path))
++            var relativePath = movie.Path.GetRelativePath(path);
++            var otherExtraFile = _otherExtraFileService.FindByPath(movie.Id, relativePath);
++
++            if (otherExtraFile == null)
+             {
+                 return;
+             }
+ 
+-            var relativePath = movie.Path.GetRelativePath(path);
+-            var otherExtraFile = _otherExtraFileService.FindByPath(movie.Id, relativePath);
+-
+-            if (otherExtraFile != null)
++            // The tracked -orig file may already be gone from disk (e.g. deleted before the next rescan).
++            // Drop its row anyway, otherwise the row renamed to this path becomes a duplicate.
++            if (_diskProvider.FileExists(path))
+             {
+                 _recycleBinProvider.DeleteFile(path);
+             }
++
++            _otherExtraFileService.Delete(otherExtraFile.Id);
+         }
+     }
+ }
+diff --git a/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupDuplicateExtraFiles.cs b/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupDuplicateExtraFiles.cs
+new file mode 100644
+index 000000000..9b3c3d8b6
+--- /dev/null
++++ b/src/NzbDrone.Core/Housekeeping/Housekeepers/CleanupDuplicateExtraFiles.cs
+@@ -0,0 +1,25 @@
++using Dapper;
++using NzbDrone.Core.Datastore;
++
++namespace NzbDrone.Core.Housekeeping.Housekeepers
++{
++    public class CleanupDuplicateExtraFiles : IHousekeepingTask
++    {
++        private readonly IMainDatabase _database;
++
++        public CleanupDuplicateExtraFiles(IMainDatabase database)
++        {
++            _database = database;
++        }
++
++        public void Clean()
++        {
++            using var mapper = _database.OpenConnection();
++            mapper.Execute(@"DELETE FROM ""ExtraFiles""
++                                     WHERE ""Id"" NOT IN (
++                                         SELECT MAX(""Id"") FROM ""ExtraFiles""
++                                         GROUP BY ""MovieId"", ""RelativePath""
++                                     )");
++        }
++    }
++}

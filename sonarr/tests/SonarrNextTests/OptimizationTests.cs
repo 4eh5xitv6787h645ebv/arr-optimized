@@ -1,4 +1,4 @@
-// DecisionScope memo, cached Database.DatabaseType and the in-memory SQLite LIKE used for blocklist rows.
+// DecisionScope memo and the in-memory SQLite LIKE used for blocklist rows.
 using System.Data.Common;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -68,23 +68,6 @@ public static partial class Tests
         }
 
         Check(other == 10, "A batch on one thread must not memoize for other threads");
-    }
-
-    static void Test_DatabaseTypeOpensOnlyOnce()
-    {
-        var opened = 0;
-        var db = new Database("test", () => { opened++; return new SqliteConnection("Data Source=:memory:"); });
-        var first = db.DatabaseType;
-        for (var i = 0; i < 10; i++)
-        {
-            Check(db.DatabaseType == first, "DatabaseType changed");
-        }
-
-        Check(first == DatabaseType.PostgreSQL && opened == 1, $"DatabaseType opened {opened} connections");
-        opened = 0;
-        db.OpenConnection().Dispose();
-        db.OpenConnection().Dispose();
-        Check(opened == 2, "OpenConnection must still open a connection every time");
     }
 
     static Func<string, string, bool?> _like;

@@ -1,0 +1,365 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arr-optimized <arr-optimized@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH 8/8] Exclusive housekeeping; validate restore uploads and keep
+ the previous DB
+
+- Housekeeping (with VACUUM) starts only when no other command runs, and a
+  queued housekeeping never holds back other commands.
+- A restore upload must be a Radarr database (or a valid config); other
+  files are rejected with a 4xx instead of replacing the live database.
+- The previous database is kept as radarr.db.pre-restore* until startup
+  after the restore succeeds, and moved back if the final move fails.
+---
+ src/NzbDrone.Core/Backup/BackupService.cs     | 173 +++++++++++++++---
+ .../Datastore/DatabaseRestorationService.cs   |  41 ++++-
+ .../Housekeeping/HousekeepingCommand.cs       |   1 +
+ .../Messaging/Commands/CommandQueue.cs        |   8 +
+ 4 files changed, 195 insertions(+), 28 deletions(-)
+
+diff --git a/src/NzbDrone.Core/Backup/BackupService.cs b/src/NzbDrone.Core/Backup/BackupService.cs
+index e6639e6f5..3c5a4b6dd 100644
+--- a/src/NzbDrone.Core/Backup/BackupService.cs
++++ b/src/NzbDrone.Core/Backup/BackupService.cs
+@@ -1,10 +1,13 @@
+ using System;
+ using System.Collections.Generic;
++using System.Data.SQLite;
+ using System.IO;
+ using System.Linq;
+ using System.Net;
+ using System.Text;
+ using System.Text.RegularExpressions;
++using System.Xml;
++using System.Xml.Linq;
+ using NLog;
+ using NzbDrone.Common;
+ using NzbDrone.Common.Disk;
+@@ -40,6 +43,8 @@ public class BackupService : IBackupService, IExecute<BackupCommand>
+         private string _backupTempFolder;
+ 
+         public static readonly Regex BackupFileRegex = new Regex(@"(nzbdrone|radarr)_backup_v?[._0-9]+\.zip", RegexOptions.Compiled | RegexOptions.IgnoreCase);
++        private static readonly byte[] SqliteHeader = Encoding.ASCII.GetBytes("SQLite format 3\0");
++        private static readonly string[] RequiredDatabaseTables = { "VersionInfo", "Config", "Movies" };
+ 
+         public BackupService(IMainDatabase maindDb,
+                              IMakeDatabaseBackup makeDatabaseBackup,
+@@ -130,45 +135,47 @@ public void Restore(string backupFileName)
+         {
+             if (backupFileName.EndsWith(".zip"))
+             {
+-                var restoredFile = false;
+                 var temporaryPath = Path.Combine(_appFolderInfo.TempFolder, "radarr_backup_restore");
+ 
+-                _archiveService.Extract(backupFileName, temporaryPath);
++                DeleteRestoreFolder(temporaryPath);
+ 
+-                foreach (var file in _diskProvider.GetFiles(temporaryPath, false))
++                try
+                 {
+-                    var fileName = Path.GetFileName(file);
++                    _archiveService.Extract(backupFileName, temporaryPath);
+ 
+-                    if (fileName.Equals("Config.xml", StringComparison.InvariantCultureIgnoreCase))
+-                    {
+-                        _diskProvider.MoveFile(file, _appFolderInfo.GetConfigPath(), true);
+-                        restoredFile = true;
+-                    }
++                    var files = _diskProvider.GetFiles(temporaryPath, false).ToList();
++                    var configFiles = files.Where(IsConfigFile).ToList();
++                    var databaseFiles = files.Where(IsDatabaseFile).ToList();
+ 
+-                    if (fileName.Equals("nzbdrone.db", StringComparison.InvariantCultureIgnoreCase))
++                    if (configFiles.Count == 0 && databaseFiles.Count == 0)
+                     {
+-                        _diskProvider.MoveFile(file, _appFolderInfo.GetDatabaseRestore(), true);
+-                        restoredFile = true;
++                        throw new RestoreBackupFailedException(HttpStatusCode.NotFound, "Unable to restore database file from backup");
+                     }
+ 
+-                    if (fileName.Equals("radarr.db", StringComparison.InvariantCultureIgnoreCase))
+-                    {
+-                        _diskProvider.MoveFile(file, _appFolderInfo.GetDatabaseRestore(), true);
+-                        restoredFile = true;
+-                    }
+-                }
++                    configFiles.ForEach(ValidateConfigFile);
++                    databaseFiles.ForEach(ValidateDatabase);
+ 
+-                if (!restoredFile)
++                    configFiles.ForEach(RestoreConfigFile);
++                    databaseFiles.ForEach(RestoreDatabase);
++                }
++                finally
+                 {
+-                    throw new RestoreBackupFailedException(HttpStatusCode.NotFound, "Unable to restore database file from backup");
++                    DeleteRestoreFolder(temporaryPath);
+                 }
+ 
+-                _diskProvider.DeleteFolder(temporaryPath, true);
++                return;
++            }
++
++            if (backupFileName.EndsWith(".xml"))
++            {
++                ValidateConfigFile(backupFileName);
++                RestoreConfigFile(backupFileName);
+ 
+                 return;
+             }
+ 
+-            _diskProvider.MoveFile(backupFileName, _appFolderInfo.GetDatabaseRestore(), true);
++            ValidateDatabase(backupFileName);
++            RestoreDatabase(backupFileName);
+         }
+ 
+         public string GetBackupFolder()
+@@ -216,6 +223,128 @@ private void BackupConfigFile()
+             _diskTransferService.TransferFile(configFile, tempConfigFile, TransferMode.Copy);
+         }
+ 
++        private void RestoreConfigFile(string file)
++        {
++            _diskProvider.MoveFile(file, _appFolderInfo.GetConfigPath(), true);
++        }
++
++        private void RestoreDatabase(string file)
++        {
++            _diskProvider.MoveFile(file, _appFolderInfo.GetDatabaseRestore(), true);
++        }
++
++        private void DeleteRestoreFolder(string path)
++        {
++            if (_diskProvider.FolderExists(path))
++            {
++                _diskProvider.DeleteFolder(path, true);
++            }
++        }
++
++        private static bool IsConfigFile(string file)
++        {
++            return Path.GetFileName(file).Equals("Config.xml", StringComparison.InvariantCultureIgnoreCase);
++        }
++
++        private static bool IsDatabaseFile(string file)
++        {
++            var fileName = Path.GetFileName(file);
++
++            return fileName.Equals("nzbdrone.db", StringComparison.InvariantCultureIgnoreCase) ||
++                   fileName.Equals("radarr.db", StringComparison.InvariantCultureIgnoreCase);
++        }
++
++        private void ValidateDatabase(string file)
++        {
++            if (!IsSqliteDatabase(file))
++            {
++                throw new RestoreBackupFailedException(HttpStatusCode.BadRequest, "Backup database is not a valid SQLite database");
++            }
++
++            if (!HasRequiredTables(file))
++            {
++                throw new RestoreBackupFailedException(HttpStatusCode.BadRequest, "Backup database is not a Radarr database");
++            }
++        }
++
++        private void ValidateConfigFile(string file)
++        {
++            if (!IsValidConfigFile(file))
++            {
++                throw new RestoreBackupFailedException(HttpStatusCode.BadRequest, "Backup config file is not a valid config file");
++            }
++        }
++
++        private bool IsValidConfigFile(string file)
++        {
++            try
++            {
++                using (var stream = _diskProvider.OpenReadStream(file))
++                {
++                    return XDocument.Load(stream).Descendants(ConfigFileProvider.CONFIG_ELEMENT_NAME).Count() == 1;
++                }
++            }
++            catch (XmlException)
++            {
++                return false;
++            }
++        }
++
++        // Rejects SQLite files that are not a Radarr main database (e.g. logs.db). If the tables cannot be
++        // read the header check alone decides, as before.
++        private bool HasRequiredTables(string file)
++        {
++            var tables = new List<string>();
++
++            try
++            {
++                // immutable: read the file as is, without locking it or creating -wal/-shm files next to it.
++                var connectionBuilder = new SQLiteConnectionStringBuilder
++                {
++                    FullUri = new Uri(file).AbsoluteUri + "?immutable=1",
++                    ReadOnly = true,
++                    FailIfMissing = true,
++                    Pooling = false
++                };
++
++                using (var connection = new SQLiteConnection(connectionBuilder.ToString()))
++                {
++                    connection.Open();
++
++                    using (var command = connection.CreateCommand())
++                    {
++                        command.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table'";
++
++                        using (var reader = command.ExecuteReader())
++                        {
++                            while (reader.Read())
++                            {
++                                tables.Add(reader.GetString(0));
++                            }
++                        }
++                    }
++                }
++            }
++            catch (Exception e)
++            {
++                _logger.Debug(e, "Unable to read tables from backup database, relying on file header");
++
++                return true;
++            }
++
++            return RequiredDatabaseTables.All(t => tables.Contains(t, StringComparer.OrdinalIgnoreCase));
++        }
++
++        private bool IsSqliteDatabase(string file)
++        {
++            var header = new byte[SqliteHeader.Length];
++
++            using (var stream = _diskProvider.OpenReadStream(file))
++            {
++                return stream.Read(header, 0, header.Length) == header.Length && header.SequenceEqual(SqliteHeader);
++            }
++        }
++
+         private void CreateVersionInfo(DateTime dateNow)
+         {
+             var tempFile = Path.Combine(_backupTempFolder, "INFO");
+diff --git a/src/NzbDrone.Core/Datastore/DatabaseRestorationService.cs b/src/NzbDrone.Core/Datastore/DatabaseRestorationService.cs
+index 4be69f5d0..f9986f84d 100644
+--- a/src/NzbDrone.Core/Datastore/DatabaseRestorationService.cs
++++ b/src/NzbDrone.Core/Datastore/DatabaseRestorationService.cs
+@@ -1,9 +1,12 @@
+ using System;
++using System.Collections.Generic;
+ using NLog;
+ using NzbDrone.Common.Disk;
+ using NzbDrone.Common.EnvironmentInfo;
+ using NzbDrone.Common.Extensions;
+ using NzbDrone.Common.Instrumentation;
++using NzbDrone.Core.Lifecycle;
++using NzbDrone.Core.Messaging.Events;
+ 
+ namespace NzbDrone.Core.Datastore
+ {
+@@ -12,8 +15,11 @@ public interface IRestoreDatabase
+         void Restore();
+     }
+ 
+-    public class DatabaseRestorationService : IRestoreDatabase
++    public class DatabaseRestorationService : IRestoreDatabase, IHandleAsync<ApplicationStartedEvent>
+     {
++        private const string PreRestoreSuffix = ".pre-restore";
++        private static readonly string[] DatabaseFileSuffixes = { "", "-shm", "-wal", "-journal" };
++
+         private readonly IDiskProvider _diskProvider;
+         private readonly IAppFolderInfo _appFolderInfo;
+         private static readonly Logger Logger = NzbDroneLogger.GetLogger(typeof(DatabaseRestorationService));
+@@ -33,24 +39,47 @@ public void Restore()
+                 return;
+             }
+ 
++            var dbPath = _appFolderInfo.GetDatabase();
++            var movedSuffixes = new List<string>();
++
+             try
+             {
+                 Logger.Info("Restoring Database");
+ 
+-                var dbPath = _appFolderInfo.GetDatabase();
++                foreach (var suffix in DatabaseFileSuffixes)
++                {
++                    _diskProvider.DeleteFile(dbPath + PreRestoreSuffix + suffix);
+ 
+-                _diskProvider.DeleteFile(dbPath + "-shm");
+-                _diskProvider.DeleteFile(dbPath + "-wal");
+-                _diskProvider.DeleteFile(dbPath + "-journal");
+-                _diskProvider.DeleteFile(dbPath);
++                    if (_diskProvider.FileExists(dbPath + suffix))
++                    {
++                        _diskProvider.MoveFile(dbPath + suffix, dbPath + PreRestoreSuffix + suffix);
++                        movedSuffixes.Add(suffix);
++                    }
++                }
+ 
+                 _diskProvider.MoveFile(dbRestorePath, dbPath);
+             }
+             catch (Exception e)
+             {
+                 Logger.Error(e, "Failed to restore database");
++
++                foreach (var suffix in movedSuffixes)
++                {
++                    _diskProvider.MoveFile(dbPath + PreRestoreSuffix + suffix, dbPath + suffix, true);
++                }
++
+                 throw;
+             }
+         }
++
++        public void HandleAsync(ApplicationStartedEvent message)
++        {
++            var dbPath = _appFolderInfo.GetDatabase();
++
++            foreach (var suffix in DatabaseFileSuffixes)
++            {
++                _diskProvider.DeleteFile(dbPath + PreRestoreSuffix + suffix);
++            }
++        }
+     }
+ }
+diff --git a/src/NzbDrone.Core/Housekeeping/HousekeepingCommand.cs b/src/NzbDrone.Core/Housekeeping/HousekeepingCommand.cs
+index ebf482ee5..937bf3794 100644
+--- a/src/NzbDrone.Core/Housekeeping/HousekeepingCommand.cs
++++ b/src/NzbDrone.Core/Housekeeping/HousekeepingCommand.cs
+@@ -4,5 +4,6 @@ namespace NzbDrone.Core.Housekeeping
+ {
+     public class HousekeepingCommand : Command
+     {
++        public override bool IsExclusive => true;
+     }
+ }
+diff --git a/src/NzbDrone.Core/Messaging/Commands/CommandQueue.cs b/src/NzbDrone.Core/Messaging/Commands/CommandQueue.cs
+index 03efc5627..3dbe0c313 100644
+--- a/src/NzbDrone.Core/Messaging/Commands/CommandQueue.cs
++++ b/src/NzbDrone.Core/Messaging/Commands/CommandQueue.cs
+@@ -3,6 +3,7 @@
+ using System.Collections.Generic;
+ using System.Linq;
+ using System.Threading;
++using NzbDrone.Core.Housekeeping;
+ 
+ namespace NzbDrone.Core.Messaging.Commands
+ {
+@@ -181,6 +182,13 @@ public bool TryGet(out CommandModel item)
+                         queuedCommands = queuedCommands.Where(c => !c.Body.IsExclusive);
+                     }
+ 
++                    // Housekeeping is exclusive, but while it waits for running commands to finish it must not
++                    // hold back the commands queued after it (e.g. RSS Sync), so it only starts once nothing is running.
++                    if (startedCommands.Any())
++                    {
++                        queuedCommands = queuedCommands.Where(c => !(c.Body is HousekeepingCommand));
++                    }
++
+                     var localItem = queuedCommands.OrderByDescending(c => c.Priority)
+                         .ThenBy(c => c.QueuedAt)
+                         .FirstOrDefault();

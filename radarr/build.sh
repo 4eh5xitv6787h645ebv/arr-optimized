@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Clone the pinned upstream tag, verify its commit, apply patches/*.patch, build Radarr.Core.dll
+# Clone the pinned upstream tag, verify its commit, apply patches/NNNN-*.patch in numeric order
+# (0001-radarr-core.patch first), build Radarr.Core.dll
 # and (unless --no-image) the local image radarr-optimized:<version>-next.
 #
 #   ./build.sh [--no-image]
@@ -21,7 +22,7 @@ if [[ "$actual" != "$UPSTREAM_COMMIT" ]]; then
   exit 1
 fi
 
-for p in "$here"/patches/*.patch; do
+for p in "$here"/patches/[0-9][0-9][0-9][0-9]-*.patch; do
   git -C "$work/src" apply --check "$p"
   git -C "$work/src" apply "$p"
   echo "applied $(basename "$p")"

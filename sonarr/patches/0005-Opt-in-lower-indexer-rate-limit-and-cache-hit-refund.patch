@@ -1,0 +1,581 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arr-optimized <arr-optimized@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH 05/10] Opt-in lower indexer rate limit and cache-hit refund
+
+Two environment variables, both unset by default (then every request and
+grab is paced exactly as on stock):
+
+- ARR_INDEXER_RATE_LIMIT_MS sets the per-indexer request interval for
+  indexer types that do not set their own limit (stock: 2000 ms).
+- ARR_INDEXER_CACHE_HIT_HEADER (and optionally ARR_INDEXER_CACHE_HIT_VALUE,
+  default HIT) names a response header from a caching proxy in front of the
+  indexer; a response marked as a cache hit gives its rate-limit slot back.
+
+With a lowered interval, grabs from one host stay at least 2 s apart,
+counted from when each grab is released, and the host interval is the last
+wait before a grab, so it holds on both sides of the grab.
+---
+ src/NzbDrone.Core/Download/DownloadService.cs |   2 +-
+ src/NzbDrone.Core/Indexers/HttpIndexerBase.cs |   4 +-
+ .../Indexers/IndexerCacheHitRateLimiter.cs    | 266 ++++++++++++++++++
+ .../Indexers/IndexerRateLimitOptions.cs       | 242 ++++++++++++++++
+ 4 files changed, 511 insertions(+), 3 deletions(-)
+ create mode 100644 src/NzbDrone.Core/Indexers/IndexerCacheHitRateLimiter.cs
+ create mode 100644 src/NzbDrone.Core/Indexers/IndexerRateLimitOptions.cs
+
+diff --git a/src/NzbDrone.Core/Download/DownloadService.cs b/src/NzbDrone.Core/Download/DownloadService.cs
+index 17bed18d15..7fe794bdcd 100644
+--- a/src/NzbDrone.Core/Download/DownloadService.cs
++++ b/src/NzbDrone.Core/Download/DownloadService.cs
+@@ -137,7 +137,7 @@ private async Task DownloadReport(RemoteEpisode remoteEpisode, IDownloadClient d
+             if (remoteEpisode.Release.DownloadUrl.IsNotNullOrWhiteSpace() && !remoteEpisode.Release.DownloadUrl.StartsWith("magnet:"))
+             {
+                 var url = new HttpUri(remoteEpisode.Release.DownloadUrl);
+-                await _rateLimitService.WaitAndPulseAsync(url.Host, TimeSpan.FromSeconds(2));
++                await IndexerRateLimitOptions.WaitForGrabAsync(_rateLimitService, url.Host, IndexerRateLimitOptions.Current);
+             }
+ 
+             IIndexer indexer = null;
+diff --git a/src/NzbDrone.Core/Indexers/HttpIndexerBase.cs b/src/NzbDrone.Core/Indexers/HttpIndexerBase.cs
+index b62b6786b4..7b750a5b09 100644
+--- a/src/NzbDrone.Core/Indexers/HttpIndexerBase.cs
++++ b/src/NzbDrone.Core/Indexers/HttpIndexerBase.cs
+@@ -30,7 +30,7 @@ public abstract class HttpIndexerBase<TSettings> : IndexerBase<TSettings>
+         public bool SupportsPaging => PageSize > 0;
+ 
+         public virtual int PageSize => 0;
+-        public virtual TimeSpan RateLimit => TimeSpan.FromSeconds(2);
++        public virtual TimeSpan RateLimit => IndexerRateLimitOptions.Current.BaseRateLimit;
+ 
+         public abstract IIndexerRequestGenerator GetRequestGenerator();
+         public abstract IParseIndexerResponse GetParser();
+@@ -357,7 +357,7 @@ protected virtual async Task<IndexerResponse> FetchIndexerResponse(IndexerReques
+ 
+             request.HttpRequest.RateLimitKey = Definition.Id.ToString();
+ 
+-            var response = await _httpClient.ExecuteAsync(request.HttpRequest);
++            var response = await IndexerCacheHitRateLimiter.ExecuteAsync(_httpClient, request.HttpRequest);
+ 
+             return new IndexerResponse(request, response);
+         }
+diff --git a/src/NzbDrone.Core/Indexers/IndexerCacheHitRateLimiter.cs b/src/NzbDrone.Core/Indexers/IndexerCacheHitRateLimiter.cs
+new file mode 100644
+index 0000000000..128501f764
+--- /dev/null
++++ b/src/NzbDrone.Core/Indexers/IndexerCacheHitRateLimiter.cs
+@@ -0,0 +1,266 @@
++using System;
++using System.Collections.Concurrent;
++using System.Collections.Generic;
++using System.Runtime.CompilerServices;
++using System.Threading;
++using System.Threading.Tasks;
++using NLog;
++using NzbDrone.Common.Cache;
++using NzbDrone.Common.Extensions;
++using NzbDrone.Common.Http;
++using NzbDrone.Common.TPL;
++
++namespace NzbDrone.Core.Indexers
++{
++    // Opt-in (ARR_INDEXER_CACHE_HIT_HEADER): when an indexer response says it was answered from a cache in front of
++    // the indexer, the rate-limit slot that request reserved is given back, so the next request to the same indexer
++    // does not wait for it. Off by default; then indexer requests go to IHttpClient exactly as on stock.
++    //
++    // How: with the option on, the indexer request is paced here instead of inside HttpClient, with the same
++    // arithmetic as RateLimitService.GetDelay on the same store (RateLimitService's cache entry), so the
++    // reservation this request made is known exactly. On a cache hit the "<host>-<indexerId>" entry is put back to
++    // its value from before this request, but only if it still holds this request's value. Every later pulse of that
++    // key with a positive interval stores a strictly later time, so a changed value means another indexer request
++    // (search, RSS or paging, here or through RateLimitService) has already reserved the slot after ours; that
++    // reservation is left alone. (.torrent/.nzb downloads never pulse this key: download clients set RateLimitKey
++    // but no RateLimit, so HttpClient does not pace them.) A request is therefore never allowed earlier than it would
++    // be had the refunded request not been made. The shared "<host>" entry is not touched: it couples all indexers
++    // and grabs (DownloadService) on one host, as on stock.
++    public class IndexerCacheHitRateLimiter : IHttpRequestInterceptor
++    {
++        // Requests paced here, so redirect hops can be handed back to HttpClient's own pacing (PreRequest).
++        private static readonly ConditionalWeakTable<HttpRequest, RequestState> PacedRequests = new ConditionalWeakTable<HttpRequest, RequestState>();
++        private static IndexerCacheHitRateLimiter _shared;
++
++        private readonly ConcurrentDictionary<string, DateTime> _rateLimitStore;
++        private readonly Func<DateTime> _utcNow;
++        private readonly Logger _logger;
++
++        public IndexerCacheHitRateLimiter(ICacheManager cacheManager, Logger logger)
++            : this(GetRateLimitStore(cacheManager), () => DateTime.UtcNow, logger)
++        {
++            // HttpClient resolves every IHttpRequestInterceptor when it is created, so this is set before the first
++            // indexer request. Indexers have no other way to reach the shared store without a constructor change.
++            Shared = this;
++        }
++
++        internal IndexerCacheHitRateLimiter(ConcurrentDictionary<string, DateTime> rateLimitStore, Func<DateTime> utcNow, Logger logger)
++        {
++            _rateLimitStore = rateLimitStore;
++            _utcNow = utcNow;
++            _logger = logger;
++        }
++
++        internal static IndexerCacheHitRateLimiter Shared
++        {
++            get => Volatile.Read(ref _shared);
++            set => Volatile.Write(ref _shared, value);
++        }
++
++        // Called by HttpIndexerBase in place of IHttpClient.ExecuteAsync.
++        public static Task<HttpResponse> ExecuteAsync(IHttpClient httpClient, HttpRequest request)
++        {
++            var options = IndexerRateLimitOptions.Current;
++            var limiter = Shared;
++
++            if (!options.RefundsCacheHits || limiter == null || request.RateLimit <= TimeSpan.Zero || request.RateLimitKey.IsNullOrWhiteSpace())
++            {
++                return httpClient.ExecuteAsync(request);
++            }
++
++            return limiter.ExecuteWithRefundAsync(httpClient, request, options);
++        }
++
++        public HttpRequest PreRequest(HttpRequest request)
++        {
++            // The first hop was paced by ExecuteWithRefundAsync. Redirect hops get their interval back, so
++            // HttpClient paces them through RateLimitService exactly as on stock.
++            if (PacedRequests.TryGetValue(request, out var state) && Interlocked.Increment(ref state.Hops) > 1)
++            {
++                request.RateLimit = state.Interval;
++            }
++
++            return request;
++        }
++
++        public HttpResponse PostResponse(HttpResponse response)
++        {
++            return response;
++        }
++
++        internal static bool IsCacheHit(HttpResponse response, IndexerRateLimitOptions options)
++        {
++            if (!options.RefundsCacheHits || response == null || response.HasHttpError || response.Headers == null)
++            {
++                return false;
++            }
++
++            var values = response.Headers.GetValues(options.CacheHitHeader);
++
++            if (values == null || values.Length == 0)
++            {
++                return false;
++            }
++
++            // Every value of the header must say hit ("HIT", or "HIT, HIT" when repeated); anything else is not a hit.
++            var tokens = 0;
++
++            foreach (var value in values)
++            {
++                foreach (var token in value.Split(',', ';'))
++                {
++                    var trimmed = token.Trim();
++
++                    if (trimmed.Length == 0)
++                    {
++                        continue;
++                    }
++
++                    if (!trimmed.Equals(options.CacheHitValue, StringComparison.OrdinalIgnoreCase))
++                    {
++                        return false;
++                    }
++
++                    tokens++;
++                }
++            }
++
++            return tokens > 0;
++        }
++
++        // Same arithmetic as RateLimitService.GetDelay for a key with a sub key, on the same store; additionally
++        // returns the sub key entry before and after this request's pulse.
++        internal Reservation Reserve(string key, string subKey, TimeSpan interval)
++        {
++            var waitUntil = _utcNow().Add(interval);
++
++            // Expand the base key timer, but don't extend it beyond now+interval.
++            var baseUntil = _rateLimitStore.AddOrUpdate(key,
++                (s) => waitUntil,
++                (s, i) => new DateTime(Math.Max(waitUntil.Ticks, i.Ticks), DateTimeKind.Utc));
++
++            if (baseUntil > waitUntil)
++            {
++                waitUntil = baseUntil;
++            }
++
++            // Wait for the full key. Equivalent to AddOrUpdate(combinedKey, waitUntil, max(waitUntil, i + interval)),
++            // written out to learn which previous value our update replaced.
++            var combinedKey = key + "-" + subKey;
++            DateTime? previous;
++            DateTime reserved;
++
++            while (true)
++            {
++                if (_rateLimitStore.TryGetValue(combinedKey, out var existing))
++                {
++                    reserved = new DateTime(Math.Max(waitUntil.Ticks, existing.Add(interval).Ticks), DateTimeKind.Utc);
++
++                    if (_rateLimitStore.TryUpdate(combinedKey, reserved, existing))
++                    {
++                        previous = existing;
++                        break;
++                    }
++                }
++                else if (_rateLimitStore.TryAdd(combinedKey, waitUntil))
++                {
++                    reserved = waitUntil;
++                    previous = null;
++                    break;
++                }
++            }
++
++            return new Reservation(combinedKey, previous, reserved, reserved - interval - _utcNow());
++        }
++
++        // Gives the reservation back if no other request has reserved this key since. Returns whether it did.
++        internal bool Refund(Reservation reservation)
++        {
++            if (reservation.Previous.HasValue)
++            {
++                return _rateLimitStore.TryUpdate(reservation.Key, reservation.Previous.Value, reservation.Reserved);
++            }
++
++            return _rateLimitStore.TryRemove(new KeyValuePair<string, DateTime>(reservation.Key, reservation.Reserved));
++        }
++
++        private async Task<HttpResponse> ExecuteWithRefundAsync(IHttpClient httpClient, HttpRequest request, IndexerRateLimitOptions options)
++        {
++            var interval = request.RateLimit;
++            var reservation = Reserve(request.Url.Host, request.RateLimitKey, interval);
++
++            if (reservation.Delay.TotalSeconds > 0.0)
++            {
++                _logger.Trace("Rate Limit triggered, delaying '{0}' for {1:0.000} sec", request.Url.Host, reservation.Delay.TotalSeconds);
++                await Task.Delay(reservation.Delay);
++            }
++
++            var state = new RequestState(interval);
++            PacedRequests.AddOrUpdate(request, state);
++
++            // Already paced above; HttpClient must not pace this hop a second time.
++            request.RateLimit = TimeSpan.Zero;
++
++            HttpResponse response;
++
++            try
++            {
++                response = await httpClient.ExecuteAsync(request);
++            }
++            finally
++            {
++                PacedRequests.Remove(request);
++                request.RateLimit = interval;
++            }
++
++            // Only a response to the hop paced here refunds; redirected requests keep stock pacing throughout.
++            if (Volatile.Read(ref state.Hops) == 1 && IsCacheHit(response, options))
++            {
++                if (Refund(reservation))
++                {
++                    _logger.Trace("Cache hit from '{0}', released its rate limit slot", request.Url.Host);
++                }
++                else
++                {
++                    _logger.Trace("Cache hit from '{0}', rate limit slot kept: another request already reserved the next one", request.Url.Host);
++                }
++            }
++
++            return response;
++        }
++
++        private static ConcurrentDictionary<string, DateTime> GetRateLimitStore(ICacheManager cacheManager)
++        {
++            // The very dictionary RateLimitService uses (same cache, same key; whichever asks first creates it).
++            return cacheManager.GetCache<ConcurrentDictionary<string, DateTime>>(typeof(RateLimitService), "rateLimitStore")
++                .Get("rateLimitStore", () => new ConcurrentDictionary<string, DateTime>());
++        }
++
++        internal sealed class Reservation
++        {
++            public Reservation(string key, DateTime? previous, DateTime reserved, TimeSpan delay)
++            {
++                Key = key;
++                Previous = previous;
++                Reserved = reserved;
++                Delay = delay;
++            }
++
++            public string Key { get; }
++            public DateTime? Previous { get; }
++            public DateTime Reserved { get; }
++            public TimeSpan Delay { get; }
++        }
++
++        private sealed class RequestState
++        {
++            public readonly TimeSpan Interval;
++            public int Hops;
++
++            public RequestState(TimeSpan interval)
++            {
++                Interval = interval;
++            }
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/Indexers/IndexerRateLimitOptions.cs b/src/NzbDrone.Core/Indexers/IndexerRateLimitOptions.cs
+new file mode 100644
+index 0000000000..da0f4b69e9
+--- /dev/null
++++ b/src/NzbDrone.Core/Indexers/IndexerRateLimitOptions.cs
+@@ -0,0 +1,242 @@
++using System;
++using System.Collections.Concurrent;
++using System.Globalization;
++using System.Runtime.CompilerServices;
++using System.Threading;
++using System.Threading.Tasks;
++using NLog;
++using NzbDrone.Common.Instrumentation;
++using NzbDrone.Common.TPL;
++
++namespace NzbDrone.Core.Indexers
++{
++    // Opt-in indexer rate-limit settings, read once from the environment on first use.
++    // With none of the variables set every value equals stock: a 2 s base rate limit and no cache-hit handling.
++    public class IndexerRateLimitOptions
++    {
++        public const string RateLimitVariable = "ARR_INDEXER_RATE_LIMIT_MS";
++        public const string CacheHitHeaderVariable = "ARR_INDEXER_CACHE_HIT_HEADER";
++        public const string CacheHitValueVariable = "ARR_INDEXER_CACHE_HIT_VALUE";
++        public const string DefaultCacheHitValue = "HIT";
++
++        public static readonly TimeSpan StockRateLimit = TimeSpan.FromSeconds(2);
++
++        // Stock DownloadService spacing of grabs from one download host.
++        public static readonly TimeSpan GrabRateLimit = TimeSpan.FromSeconds(2);
++        public static readonly IndexerRateLimitOptions Stock = new IndexerRateLimitOptions(StockRateLimit, null, DefaultCacheHitValue);
++
++        private static readonly object CurrentLock = new object();
++        private static IndexerRateLimitOptions _current;
++
++        // Grab-to-grab spacing per download host when the base rate limit is lowered (see WaitForGrabAsync), kept per
++        // rate-limit service instance like RateLimitService's own store.
++        private static readonly ConditionalWeakTable<IRateLimitService, ConcurrentDictionary<string, GrabGate>> GrabGates =
++            new ConditionalWeakTable<IRateLimitService, ConcurrentDictionary<string, GrabGate>>();
++
++        public IndexerRateLimitOptions(TimeSpan baseRateLimit, string cacheHitHeader, string cacheHitValue)
++        {
++            BaseRateLimit = baseRateLimit;
++            CacheHitHeader = string.IsNullOrWhiteSpace(cacheHitHeader) ? null : cacheHitHeader.Trim();
++            CacheHitValue = string.IsNullOrWhiteSpace(cacheHitValue) ? DefaultCacheHitValue : cacheHitValue.Trim();
++        }
++
++        // Rate limit for indexer types that do not override HttpIndexerBase.RateLimit.
++        public TimeSpan BaseRateLimit { get; }
++
++        // Response header that marks an answer served from a cache in front of the indexer; null when off.
++        public string CacheHitHeader { get; }
++
++        // Header value that means "cache hit" (compared case-insensitively).
++        public string CacheHitValue { get; }
++
++        public bool RefundsCacheHits => CacheHitHeader != null;
++
++        public bool IsStock => BaseRateLimit == StockRateLimit && !RefundsCacheHits;
++
++        // The options in effect. Setting null makes the next read parse the environment again (used by tests).
++        public static IndexerRateLimitOptions Current
++        {
++            get
++            {
++                var current = Volatile.Read(ref _current);
++
++                if (current != null)
++                {
++                    return current;
++                }
++
++                lock (CurrentLock)
++                {
++                    if (_current == null)
++                    {
++                        Volatile.Write(ref _current, FromEnvironment(Environment.GetEnvironmentVariable, NzbDroneLogger.GetLogger(typeof(IndexerRateLimitOptions))));
++                    }
++
++                    return _current;
++                }
++            }
++
++            internal set
++            {
++                lock (CurrentLock)
++                {
++                    Volatile.Write(ref _current, value);
++                }
++            }
++        }
++
++        // Paces a grab from a download host; called by DownloadService before each grab. Stock (and whenever the base
++        // rate limit is not lowered) this is exactly the stock call: one 2 s pulse of "<host>". That pulse also sets the
++        // earliest start of the next indexer request to the same host (RateLimitService takes max(now + I, "<host>")),
++        // which is harmless at the stock I = 2 s but would hold the next search up to 2 s - I longer than stock with a
++        // lowered I. So with a lowered base, grabs keep their stock 2 s spacing against each other, counted from the time
++        // each grab was released, and "<host>" is pulsed with the base interval: the grab still waits for the previous
++        // request to that host, exactly as it waits for it on stock, but the next search is no longer held for the rest
++        // of the 2 s.
++        internal static Task WaitForGrabAsync(IRateLimitService rateLimitService, string host, IndexerRateLimitOptions options)
++        {
++            if (options.BaseRateLimit >= GrabRateLimit)
++            {
++                return rateLimitService.WaitAndPulseAsync(host, GrabRateLimit);
++            }
++
++            return WaitForGrabWithLoweredBaseAsync(rateLimitService, host, options.BaseRateLimit);
++        }
++
++        public static IndexerRateLimitOptions FromEnvironment(Func<string, string> getVariable, Logger logger)
++        {
++            var baseRateLimit = StockRateLimit;
++            var rateLimitText = getVariable(RateLimitVariable);
++
++            if (!string.IsNullOrWhiteSpace(rateLimitText))
++            {
++                // Digits only: no sign, no decimals, no thousands separators.
++                if (long.TryParse(rateLimitText.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var milliseconds) &&
++                    milliseconds <= (long)TimeSpan.FromDays(1).TotalMilliseconds)
++                {
++                    baseRateLimit = TimeSpan.FromTicks(milliseconds * TimeSpan.TicksPerMillisecond);
++                }
++                else
++                {
++                    logger.Warn("Ignoring {0}='{1}': expected a whole number of milliseconds from 0 to 86400000. Using the default of {2} ms.",
++                        RateLimitVariable, rateLimitText, (long)StockRateLimit.TotalMilliseconds);
++                }
++            }
++
++            string cacheHitHeader = null;
++            var headerText = getVariable(CacheHitHeaderVariable);
++
++            if (!string.IsNullOrWhiteSpace(headerText))
++            {
++                if (IsHeaderName(headerText.Trim()))
++                {
++                    cacheHitHeader = headerText.Trim();
++                }
++                else
++                {
++                    logger.Warn("Ignoring {0}='{1}': not a valid HTTP header name. Cache hits will not skip the indexer rate limit.", CacheHitHeaderVariable, headerText);
++                }
++            }
++
++            var cacheHitValue = DefaultCacheHitValue;
++            var valueText = getVariable(CacheHitValueVariable);
++
++            if (!string.IsNullOrWhiteSpace(valueText))
++            {
++                if (cacheHitHeader == null)
++                {
++                    logger.Warn("Ignoring {0}: {1} is not set.", CacheHitValueVariable, CacheHitHeaderVariable);
++                }
++                else if (valueText.IndexOfAny(new[] { ',', ';' }) >= 0 || HasControlCharacter(valueText))
++                {
++                    logger.Warn("Ignoring {0}='{1}': the value must be a single token without ',' or ';'. Using '{2}'.", CacheHitValueVariable, valueText, DefaultCacheHitValue);
++                }
++                else
++                {
++                    cacheHitValue = valueText.Trim();
++                }
++            }
++
++            var options = new IndexerRateLimitOptions(baseRateLimit, cacheHitHeader, cacheHitValue);
++
++            if (options.BaseRateLimit != StockRateLimit)
++            {
++                logger.Info("Indexer rate limit for indexers without their own limit: {0} ms (stock {1} ms), set by {2}",
++                    (long)options.BaseRateLimit.TotalMilliseconds, (long)StockRateLimit.TotalMilliseconds, RateLimitVariable);
++            }
++
++            if (options.RefundsCacheHits)
++            {
++                logger.Info("Indexer responses with '{0}: {1}' release their rate-limit slot, set by {2}", options.CacheHitHeader, options.CacheHitValue, CacheHitHeaderVariable);
++            }
++
++            return options;
++        }
++
++        private static async Task WaitForGrabWithLoweredBaseAsync(IRateLimitService rateLimitService, string host, TimeSpan baseRateLimit)
++        {
++            var gate = GrabGates.GetValue(rateLimitService, _ => new ConcurrentDictionary<string, GrabGate>())
++                .GetOrAdd(host, _ => new GrabGate());
++
++            // Grabs from one host go one at a time on this path, so each one sees when the previous one was released.
++            await gate.Lock.WaitAsync();
++
++            try
++            {
++                // At least 2 s after the previous grab from this host was released, as stock spaces grabs.
++                var delay = gate.LastRelease + GrabRateLimit - DateTime.UtcNow;
++
++                if (delay > TimeSpan.Zero)
++                {
++                    await Task.Delay(delay);
++                }
++
++                // Then wait for the previous request to this host and pulse it with the base interval. This is the last
++                // wait before the grab goes out, so the "<host>" spacing holds on both sides of the grab, and the 2 s
++                // grab spacing is counted from the moment the grab is actually released.
++                await rateLimitService.WaitAndPulseAsync(host, baseRateLimit);
++
++                gate.LastRelease = DateTime.UtcNow;
++            }
++            finally
++            {
++                gate.Lock.Release();
++            }
++        }
++
++        private sealed class GrabGate
++        {
++            public readonly SemaphoreSlim Lock = new SemaphoreSlim(1, 1);
++            public DateTime LastRelease = DateTime.MinValue;
++        }
++
++        // RFC 9110 token characters.
++        private static bool IsHeaderName(string name)
++        {
++            foreach (var c in name)
++            {
++                var isToken = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || "!#$%&'*+-.^_`|~".IndexOf(c) >= 0;
++
++                if (!isToken)
++                {
++                    return false;
++                }
++            }
++
++            return name.Length > 0;
++        }
++
++        private static bool HasControlCharacter(string value)
++        {
++            foreach (var c in value)
++            {
++                if (char.IsControl(c))
++                {
++                    return true;
++                }
++            }
++
++            return false;
++        }
++    }
++}

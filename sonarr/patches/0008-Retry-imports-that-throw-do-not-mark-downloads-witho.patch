@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arr-optimized <arr-optimized@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH 08/10] Retry imports that throw; do not mark downloads without
+ episodes imported
+
+- An automatic import that throws goes back to ImportPending and is retried
+  on the next check, instead of staying in Importing until restart.
+- A download whose import mapped zero episodes is no longer marked
+  Imported.
+---
+ .../Download/CompletedDownloadService.cs      | 42 ++++++++++++++++---
+ .../TrackedDownloadAlreadyImported.cs         |  6 +++
+ 2 files changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/src/NzbDrone.Core/Download/CompletedDownloadService.cs b/src/NzbDrone.Core/Download/CompletedDownloadService.cs
+index 40f389c991..39d04b28f2 100644
+--- a/src/NzbDrone.Core/Download/CompletedDownloadService.cs
++++ b/src/NzbDrone.Core/Download/CompletedDownloadService.cs
+@@ -160,13 +160,24 @@ public void Import(TrackedDownload trackedDownload)
+             trackedDownload.State = TrackedDownloadState.Importing;
+ 
+             var outputPath = trackedDownload.ImportItem.OutputPath.FullPath;
+-            var importResults = _downloadedEpisodesImportService.ProcessPath(outputPath,
+-                ImportMode.Auto,
+-                trackedDownload.RemoteEpisode.Series,
+-                trackedDownload.ImportItem);
++            List<ImportResult> importResults;
+ 
+-            if (VerifyImport(trackedDownload, importResults))
++            try
+             {
++                importResults = _downloadedEpisodesImportService.ProcessPath(outputPath,
++                    ImportMode.Auto,
++                    trackedDownload.RemoteEpisode.Series,
++                    trackedDownload.ImportItem);
++
++                if (VerifyImport(trackedDownload, importResults))
++                {
++                    return;
++                }
++            }
++            catch (Exception ex)
++            {
++                SetStateAfterImportFailure(trackedDownload, ex);
++
+                 return;
+             }
+ 
+@@ -364,6 +375,27 @@ private void SetStateToImportBlocked(TrackedDownload trackedDownload)
+             }
+         }
+ 
++        private void SetStateAfterImportFailure(TrackedDownload trackedDownload, Exception ex)
++        {
++            // Only ImportPending downloads are imported again, so a download left in Importing would stay there until a restart.
++            var message = $"Import failed and will be retried: {ex.Message}";
++
++            if (trackedDownload.StatusMessages.Any(m => m.Messages != null && m.Messages.Contains(message)))
++            {
++                _logger.Debug(ex, "Import failed again for '{0}'", trackedDownload.DownloadItem.Title);
++            }
++            else
++            {
++                _logger.Warn(ex, "Import failed for '{0}', it will be retried", trackedDownload.DownloadItem.Title);
++            }
++
++            if (trackedDownload.State == TrackedDownloadState.Importing)
++            {
++                trackedDownload.State = TrackedDownloadState.ImportPending;
++                trackedDownload.Warn(new TrackedDownloadStatusMessage(trackedDownload.DownloadItem.Title, message));
++            }
++        }
++
+         private void SetImportItem(TrackedDownload trackedDownload)
+         {
+             trackedDownload.ImportItem = _provideImportItemService.ProvideImportItem(trackedDownload.DownloadItem, trackedDownload.ImportItem);
+diff --git a/src/NzbDrone.Core/Download/TrackedDownloads/TrackedDownloadAlreadyImported.cs b/src/NzbDrone.Core/Download/TrackedDownloads/TrackedDownloadAlreadyImported.cs
+index b0f75be0f9..7498243eab 100644
+--- a/src/NzbDrone.Core/Download/TrackedDownloads/TrackedDownloadAlreadyImported.cs
++++ b/src/NzbDrone.Core/Download/TrackedDownloads/TrackedDownloadAlreadyImported.cs
+@@ -30,6 +30,12 @@ public bool IsImported(TrackedDownload trackedDownload, List<EpisodeHistory> his
+                 return false;
+             }
+ 
++            if (trackedDownload.RemoteEpisode.Episodes.Empty())
++            {
++                _logger.Trace("No episodes mapped for {0}", trackedDownload.DownloadItem.Title);
++                return false;
++            }
++
+             var allEpisodesImportedInHistory = trackedDownload.RemoteEpisode.Episodes.All(e =>
+             {
+                 var lastHistoryItem = historyItems.FirstOrDefault(h => h.EpisodeId == e.Id);

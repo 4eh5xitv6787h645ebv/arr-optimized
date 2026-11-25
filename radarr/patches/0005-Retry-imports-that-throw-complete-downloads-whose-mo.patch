@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arr-optimized <arr-optimized@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH 5/8] Retry imports that throw; complete downloads whose movie
+ link was lost
+
+- An automatic import that throws goes back to ImportPending and is retried
+  on the next check, instead of staying in Importing until restart.
+- A download whose movie link was lost is completed with the movie id from
+  the import results or from its latest history item; IsImported no longer
+  throws when the movie is null.
+---
+ .../Download/CompletedDownloadService.cs      | 95 +++++++++++++++++--
+ .../TrackedDownloadAlreadyImported.cs         | 10 +-
+ 2 files changed, 94 insertions(+), 11 deletions(-)
+
+diff --git a/src/NzbDrone.Core/Download/CompletedDownloadService.cs b/src/NzbDrone.Core/Download/CompletedDownloadService.cs
+index e9b3feb66..5eb292440 100644
+--- a/src/NzbDrone.Core/Download/CompletedDownloadService.cs
++++ b/src/NzbDrone.Core/Download/CompletedDownloadService.cs
+@@ -139,13 +139,24 @@ public void Import(TrackedDownload trackedDownload)
+             trackedDownload.State = TrackedDownloadState.Importing;
+ 
+             var outputPath = trackedDownload.ImportItem.OutputPath.FullPath;
+-            var importResults = _downloadedMovieImportService.ProcessPath(outputPath,
+-                ImportMode.Auto,
+-                trackedDownload.RemoteMovie.Movie,
+-                trackedDownload.ImportItem);
++            List<ImportResult> importResults;
+ 
+-            if (VerifyImport(trackedDownload, importResults))
++            try
+             {
++                importResults = _downloadedMovieImportService.ProcessPath(outputPath,
++                    ImportMode.Auto,
++                    trackedDownload.RemoteMovie.Movie,
++                    trackedDownload.ImportItem);
++
++                if (VerifyImport(trackedDownload, importResults))
++                {
++                    return;
++                }
++            }
++            catch (Exception ex)
++            {
++                SetStateAfterImportFailure(trackedDownload, ex);
++
+                 return;
+             }
+ 
+@@ -199,9 +210,16 @@ public bool VerifyImport(TrackedDownload trackedDownload, List<ImportResult> imp
+ 
+             if (allMoviesImported)
+             {
++                var importedMovieId = GetMovieId(trackedDownload, importResults, null);
++
++                if (!importedMovieId.HasValue)
++                {
++                    return false;
++                }
++
+                 _logger.Debug("All movies were imported for {0}", trackedDownload.DownloadItem.Title);
+                 trackedDownload.State = TrackedDownloadState.Imported;
+-                _eventAggregator.PublishEvent(new DownloadCompletedEvent(trackedDownload, trackedDownload.RemoteMovie.Movie.Id));
++                _eventAggregator.PublishEvent(new DownloadCompletedEvent(trackedDownload, importedMovieId.Value));
+                 return true;
+             }
+ 
+@@ -218,6 +236,13 @@ public bool VerifyImport(TrackedDownload trackedDownload, List<ImportResult> imp
+ 
+             if (allMoviesImportedInHistory)
+             {
++                var movieId = GetMovieId(trackedDownload, importResults, historyItems);
++
++                if (!movieId.HasValue)
++                {
++                    return false;
++                }
++
+                 // Log different error messages depending on the circumstances, but treat both as fully imported, because that's the reality.
+                 // The second message shouldn't be logged in most cases, but continued reporting would indicate an ongoing issue.
+                 if (atLeastOneMovieImported)
+@@ -228,7 +253,7 @@ public bool VerifyImport(TrackedDownload trackedDownload, List<ImportResult> imp
+                 {
+                     _logger.ForDebugEvent()
+                            .Message("No Movies were just imported, but all movies were previously imported, possible issue with download history.")
+-                           .Property("MovieId", trackedDownload.RemoteMovie.Movie.Id)
++                           .Property("MovieId", movieId.Value)
+                            .Property("DownloadId", trackedDownload.DownloadItem.DownloadId)
+                            .Property("Title", trackedDownload.DownloadItem.Title)
+                            .Property("Path", trackedDownload.ImportItem.OutputPath.ToString())
+@@ -237,7 +262,7 @@ public bool VerifyImport(TrackedDownload trackedDownload, List<ImportResult> imp
+                 }
+ 
+                 trackedDownload.State = TrackedDownloadState.Imported;
+-                _eventAggregator.PublishEvent(new DownloadCompletedEvent(trackedDownload, trackedDownload.RemoteMovie.Movie.Id));
++                _eventAggregator.PublishEvent(new DownloadCompletedEvent(trackedDownload, movieId.Value));
+ 
+                 return true;
+             }
+@@ -246,6 +271,39 @@ public bool VerifyImport(TrackedDownload trackedDownload, List<ImportResult> imp
+             return false;
+         }
+ 
++        private int? GetMovieId(TrackedDownload trackedDownload, List<ImportResult> importResults, List<MovieHistory> historyItems)
++        {
++            // The tracked download can lose its movie link while it's being processed, the cached item
++            // is rebuilt from the download title alone whenever a movie is added, edited or deleted.
++            // Read it once, another thread can replace RemoteMovie at any time.
++            var trackedMovie = trackedDownload.RemoteMovie?.Movie;
++
++            if (trackedMovie != null)
++            {
++                return trackedMovie.Id;
++            }
++
++            var movieId = importResults.Where(c => c.Result == ImportResultType.Imported)
++                                       .Select(c => c.ImportDecision?.LocalMovie?.Movie?.Id ?? 0)
++                                       .FirstOrDefault(id => id > 0);
++
++            if (movieId == 0 && historyItems != null)
++            {
++                movieId = historyItems.Select(h => h.MovieId).FirstOrDefault(id => id > 0);
++            }
++
++            if (movieId == 0)
++            {
++                // Don't complete the download with movie id 0, that would add a history row for no movie and could remove
++                // the download from the client.
++                _logger.Warn("Unable to determine which movie was imported for {0}, not marking it as imported", trackedDownload.DownloadItem.Title);
++
++                return null;
++            }
++
++            return movieId;
++        }
++
+         private void SetStateToImportBlocked(TrackedDownload trackedDownload)
+         {
+             trackedDownload.State = TrackedDownloadState.ImportBlocked;
+@@ -263,6 +321,27 @@ private void SetStateToImportBlocked(TrackedDownload trackedDownload)
+             }
+         }
+ 
++        private void SetStateAfterImportFailure(TrackedDownload trackedDownload, Exception ex)
++        {
++            // Only ImportPending downloads are imported again, so a download left in Importing would stay there until a restart.
++            var message = $"Import failed and will be retried: {ex.Message}";
++
++            if (trackedDownload.StatusMessages.Any(m => m.Messages != null && m.Messages.Contains(message)))
++            {
++                _logger.Debug(ex, "Import failed again for '{0}'", trackedDownload.DownloadItem.Title);
++            }
++            else
++            {
++                _logger.Warn(ex, "Import failed for '{0}', it will be retried", trackedDownload.DownloadItem.Title);
++            }
++
++            if (trackedDownload.State == TrackedDownloadState.Importing)
++            {
++                trackedDownload.State = TrackedDownloadState.ImportPending;
++                trackedDownload.Warn(new TrackedDownloadStatusMessage(trackedDownload.DownloadItem.Title, message));
++            }
++        }
++
+         private void SetImportItem(TrackedDownload trackedDownload)
+         {
+             trackedDownload.ImportItem = _provideImportItemService.ProvideImportItem(trackedDownload.DownloadItem, trackedDownload.ImportItem);
+diff --git a/src/NzbDrone.Core/Download/TrackedDownloads/TrackedDownloadAlreadyImported.cs b/src/NzbDrone.Core/Download/TrackedDownloads/TrackedDownloadAlreadyImported.cs
+index 13eb50ec7..7fb9e26a9 100644
+--- a/src/NzbDrone.Core/Download/TrackedDownloads/TrackedDownloadAlreadyImported.cs
++++ b/src/NzbDrone.Core/Download/TrackedDownloads/TrackedDownloadAlreadyImported.cs
+@@ -30,13 +30,17 @@ public bool IsImported(TrackedDownload trackedDownload, List<MovieHistory> histo
+                 return false;
+             }
+ 
+-            var movie = trackedDownload.RemoteMovie.Movie;
++            var movie = trackedDownload.RemoteMovie?.Movie;
+ 
+-            var lastHistoryItem = historyItems.FirstOrDefault(h => h.MovieId == movie.Id);
++            // The cached tracked download loses its movie when it is rebuilt from a title that doesn't map to a movie (a
++            // download whose movie came from grab history), use the most recent history for the download in that case.
++            var lastHistoryItem = movie == null
++                ? historyItems.FirstOrDefault()
++                : historyItems.FirstOrDefault(h => h.MovieId == movie.Id);
+ 
+             if (lastHistoryItem == null)
+             {
+-                _logger.Trace("No history for movie: {0}", movie.ToString());
++                _logger.Trace("No history for movie: {0}", movie?.ToString());
+                 return false;
+             }
+ 

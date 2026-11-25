@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Clone the pinned upstream tag, verify its commit, apply patches/*.patch in order,
+# Clone the pinned upstream tag, verify its commit, apply patches/NNNN-*.patch in numeric order,
 # build Sonarr.Core.dll into artifacts/ and (with --image) build the Docker image.
 #
 #   ./build.sh            build artifacts/Sonarr.Core.dll
