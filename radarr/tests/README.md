@@ -42,7 +42,7 @@ dotnet test src/NzbDrone.Core.Test/Radarr.Core.Test.csproj -c Debug -f net10.0 \
 
 They compile against stock and older builds too: the batch-memo pieces are resolved by name.
 
-### Fixtures for patches 0002–0008
+### Fixtures for patches 0002–0010
 
 Each folder below mirrors upstream's `src/` folder, so it is copied over the build tree as is.
 
@@ -55,18 +55,23 @@ Each folder below mirrors upstream's `src/` folder, so it is copied over the bui
 | `Scheduler` | 0006 | `JobTests/SchedulerFixture.cs`; `SchedulerRestartMeasurement.cs` is `[Explicit]` (measurement only) |
 | `Extras` | 0007 | `Extras/Others/*`, `Housekeeping/*` |
 | `RadarrDb` | 0008 | `Messaging/Commands/HousekeepingCommandQueueFixture.cs`, `BackupTests/*`, `Datastore/DatabaseRestorationServiceFixture.cs` |
+| `Optimize` | 0009 | `OptimizeTests/*` (185 cases): defaults equal the constants of 0001–0004 and stock; precedence environment > saved > default and every bound; save applies at once (cache counts, live request timing over real HTTP, grab spacing with strict mocks); custom-format decisions equal the stock grouping rule across capacity × expiry × input limit and while limits change; ffprobe cache limits with a fixed clock; counters; ffprobe time limit 0 = no limit. `NzbDrone.Api.Test/v3/Config/OptimizeConfigControllerFixture.cs`: GET, PUT round trip, partial PUT, reset by default value, field errors through the request pipeline |
+| `Polish` | 0010 and earlier patches | `Messaging/Commands/HousekeepingDeferralFixture.cs` (30-minute bound and its logging), `Profiles/Releases/ReleaseProfileServiceCopyFixture.cs` (copies), `MediaFiles/MediaInfo/VideoFileInfoReaderReplacedFileFixture.cs` and `MediaInfoProbeCacheInvalidationFixture.cs` (uses `FFprobe`'s sample media, so copy `FFprobe` first), `NzbDrone.Host.Test/MediaInfoCacheContainerFixture.cs` (container wiring), `JobTests/SchedulerTimerLifecycleFixture.cs` (0006), `IndexerTests/RateLimitTests/GrabGateHostsFixture.cs` (0002, grabs to two hosts) |
 
 ```sh
-for g in RateLimit Perf FFprobe Imports Scheduler Extras RadarrDb; do cp -r tests/UpstreamFixtures/$g/. <tree>/src/; done
+for g in RateLimit Perf FFprobe Imports Scheduler Extras RadarrDb Optimize Polish; do cp -r tests/UpstreamFixtures/$g/NzbDrone.* <tree>/src/; done
 cd <tree>
 dotnet build src/NzbDrone.Core.Test/Radarr.Core.Test.csproj -c Release -p:EnableAnalyzers=false -p:TreatWarningsAsErrors=false
-dotnet test _tests/net10.0/Radarr.Core.Test.dll --filter "FullyQualifiedName~RateLimitTests|FullyQualifiedName~PerfNext|FullyQualifiedName~MediaFiles.MediaInfo|FullyQualifiedName~ImportFixes|FullyQualifiedName~JobTests.SchedulerFixture|FullyQualifiedName~OtherExtraFileRenamer|FullyQualifiedName~DuplicateExtraFiles|FullyQualifiedName~BackupTests|FullyQualifiedName~DatabaseRestorationServiceFixture|FullyQualifiedName~HousekeepingCommandQueueFixture"
+dotnet test _tests/net10.0/Radarr.Core.Test.dll --filter "FullyQualifiedName~RateLimitTests|FullyQualifiedName~PerfNext|FullyQualifiedName~MediaFiles.MediaInfo|FullyQualifiedName~ImportFixes|FullyQualifiedName~JobTests.SchedulerFixture|FullyQualifiedName~OtherExtraFileRenamer|FullyQualifiedName~DuplicateExtraFiles|FullyQualifiedName~BackupTests|FullyQualifiedName~DatabaseRestorationServiceFixture|FullyQualifiedName~HousekeepingCommandQueueFixture|FullyQualifiedName~OptimizeTests|FullyQualifiedName~HousekeepingDeferralFixture|FullyQualifiedName~ReleaseProfileServiceCopyFixture|FullyQualifiedName~JobTests"
+dotnet build src/NzbDrone.Api.Test/Radarr.Api.Test.csproj -c Release -p:EnableAnalyzers=false -p:TreatWarningsAsErrors=false
+dotnet test _tests/net10.0/Radarr.Api.Test.dll
 ```
 
 `[Category("PerfNextBenchmark")]` tests are `[Explicit]` timings, not checks. To run the database
 fixtures against PostgreSQL, set `Radarr__Postgres__Host`, `__Port`, `__User` and `__Password`.
 
-The container fixture needs the Host test project and `Radarr.Mono.dll` next to it:
+The container fixtures (`IndexerRateLimitContainerFixture`, `MediaInfoCacheContainerFixture`) need the
+Host test project and `Radarr.Mono.dll` next to it:
 
 ```sh
 dotnet build src/NzbDrone.Mono/Radarr.Mono.csproj -c Release -p:EnableAnalyzers=false
@@ -76,5 +81,6 @@ dotnet test _tests/net10.0/Radarr.Host.Test.dll
 ```
 
 Some fixtures only compile on a patched tree, because they use the new types
-(`IndexerRateLimitOptions`, `IndexerCacheHitRateLimiter`, `MediaInfoProbeCache`). The others
+(`IndexerRateLimitOptions`, `IndexerCacheHitRateLimiter`, `MediaInfoProbeCache`,
+`NzbDrone.Core.Optimize`). The others
 compile on stock too, which is how the regression tests were shown to fail there.

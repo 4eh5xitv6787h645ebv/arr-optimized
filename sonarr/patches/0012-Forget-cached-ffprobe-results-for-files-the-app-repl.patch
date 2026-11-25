@@ -1,0 +1,228 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arr-optimized <arr-optimized@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH 12/12] Forget cached ffprobe results for files the app
+ replaces
+
+The ffprobe cache matches a file by path, size and last write time. With
+"Change File Date" an upgrade imported to the same path gets the same last
+write time as the file it replaced, so a new file of exactly the same size
+could get the old file's media info.
+
+- Importing, deleting or renaming an episode file drops the cache entries
+  for the paths involved (EpisodeImportedEvent, EpisodeFileDeletedEvent,
+  EpisodeFileRenamedEvent).
+- A probe that overlapped such an invalidation is not stored, so a probe of
+  the old file cannot put its result back after the file was replaced.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../MediaInfo/MediaInfoProbeCache.cs          | 60 ++++++++++++++++++-
+ .../MediaInfo/VideoFileInfoReader.cs          | 49 ++++++++++++++-
+ 2 files changed, 104 insertions(+), 5 deletions(-)
+
+diff --git a/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs b/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs
+index c2bed45eef..122f442995 100644
+--- a/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs
++++ b/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs
+@@ -1,10 +1,12 @@
+ using System;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
++using System.IO;
+ using System.Linq;
+ using System.Reflection;
+ using System.Runtime.CompilerServices;
+ using System.Threading;
++using NzbDrone.Common.Extensions;
+ using NzbDrone.Core.Optimization;
+ 
+ namespace NzbDrone.Core.MediaFiles.MediaInfo
+@@ -13,8 +15,10 @@ namespace NzbDrone.Core.MediaFiles.MediaInfo
+     // repeatedly (blocked queue items are re-imported every minute, sample detection and aggregation probe
+     // the same file during one import, manual import previews). An entry is used only while the path and the
+     // file stamp (size, last write time and, for a symlink, the last write time of its final target) are
+-    // exactly those seen before and after the probe. Callers get their own copy of the model, never the
+-    // cached instance.
++    // exactly those seen before and after the probe. Entries for a path are also dropped when the app imports,
++    // deletes or renames a file there (Invalidate): with "Change File Date" a new file gets the same last write
++    // time as the file it replaced, so the stamp alone may not tell them apart. Callers get their own copy of
++    // the model, never the cached instance.
+     //
+     // The constants below are the defaults of the Optimize page values; the limits in effect are read from
+     // OptimizeSettings.Current on every call, and Apply trims or clears the entries when they change.
+@@ -63,6 +67,9 @@ internal sealed class MediaInfoProbeCache
+         private long _bytes;
+         private long _lastSweep;
+ 
++        // Incremented by every Invalidate; a probe that overlapped one is not stored (see Add).
++        private long _generation;
++
+         internal long Hits;
+         internal long Misses;
+         internal long Stores;
+@@ -187,6 +194,8 @@ private static bool Expired(Entry entry, long now, ProbeCacheLimits limits)
+ 
+         internal long Bytes => Volatile.Read(ref _bytes);
+ 
++        internal long Generation => Interlocked.Read(ref _generation);
++
+         internal bool TryGet(string path, long length, DateTime lastWrite, out MediaInfoModel model)
+         {
+             return TryGet(path, new FileStamp(length, lastWrite), out model);
+@@ -236,7 +245,9 @@ internal void Add(string path, long length, DateTime lastWrite, MediaInfoModel m
+         }
+ 
+         // probeStartedUtc: when the probe whose result this is started; the settle rule is judged at that time.
+-        internal void Add(string path, FileStamp stamp, MediaInfoModel model, DateTime probeStartedUtc)
++        // generation: Generation read before the probe started; if any path was invalidated since, the result is
++        // not stored, so a probe of a file that the app replaced while it ran cannot put the old result back.
++        internal void Add(string path, FileStamp stamp, MediaInfoModel model, DateTime probeStartedUtc, long? generation = null)
+         {
+             var limits = Limits;
+ 
+@@ -268,6 +279,11 @@ internal void Add(string path, FileStamp stamp, MediaInfoModel model, DateTime p
+ 
+             lock (_writer)
+             {
++                if (generation.HasValue && generation.Value != _generation)
++                {
++                    return;
++                }
++
+                 if (_entries.TryGetValue(path, out var old))
+                 {
+                     Remove(path, old);
+@@ -301,6 +317,44 @@ internal void Add(string path, FileStamp stamp, MediaInfoModel model, DateTime p
+             }
+         }
+ 
++        // Drops the entries for this path (compared as the app compares paths, so a different spelling of the same
++        // path is found too). Called when the app imports, deletes or renames a file at the path.
++        internal void Invalidate(string path)
++        {
++            if (path.IsNullOrWhiteSpace())
++            {
++                return;
++            }
++
++            var fileName = Path.GetFileName(path);
++
++            lock (_writer)
++            {
++                _generation++;
++
++                foreach (var pair in _entries)
++                {
++                    if (string.Equals(pair.Key, path, StringComparison.Ordinal) ||
++                        (pair.Key.EndsWith(fileName, StringComparison.OrdinalIgnoreCase) && SamePath(pair.Key, path)))
++                    {
++                        Remove(pair.Key, pair.Value);
++                    }
++                }
++            }
++        }
++
++        private static bool SamePath(string cachedPath, string path)
++        {
++            try
++            {
++                return cachedPath.PathEquals(path);
++            }
++            catch (ArgumentException)
++            {
++                return false;
++            }
++        }
++
+         internal void Clear()
+         {
+             lock (_writer)
+diff --git a/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs b/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs
+index cabf32d93f..a8d4b23ad1 100644
+--- a/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs
++++ b/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs
+@@ -8,6 +8,8 @@
+ using NLog;
+ using NzbDrone.Common.Disk;
+ using NzbDrone.Common.Extensions;
++using NzbDrone.Core.MediaFiles.Events;
++using NzbDrone.Core.Messaging.Events;
+ using NzbDrone.Core.Optimization;
+ 
+ namespace NzbDrone.Core.MediaFiles.MediaInfo
+@@ -18,7 +20,10 @@ public interface IVideoFileInfoReader
+         TimeSpan? GetRunTime(string filename);
+     }
+ 
+-    public class VideoFileInfoReader : IVideoFileInfoReader
++    public class VideoFileInfoReader : IVideoFileInfoReader,
++        IHandle<EpisodeImportedEvent>,
++        IHandle<EpisodeFileDeletedEvent>,
++        IHandle<EpisodeFileRenamedEvent>
+     {
+         private readonly IDiskProvider _diskProvider;
+         private readonly Logger _logger;
+@@ -83,18 +88,58 @@ public MediaInfoModel GetMediaInfo(string filename)
+                 return cachedMediaInfo;
+             }
+ 
++            var generation = _probeCache.Generation;
+             var probeStarted = MediaInfoProbeCache.UtcNow();
+             var mediaInfo = ProbeMediaInfo(filename);
+ 
+             // Remember the result only if the file did not change while it was probed
+             if (TryGetFileStamp(filename, out var stampAfter) && stampAfter.Equals(stamp))
+             {
+-                _probeCache.Add(filename, stamp, mediaInfo, probeStarted);
++                _probeCache.Add(filename, stamp, mediaInfo, probeStarted, generation);
+             }
+ 
+             return mediaInfo;
+         }
+ 
++        // The app put a new file at a path, deleted one or renamed one: forget what was probed at those paths. With
++        // "Change File Date" a new file gets the same last write time as the file it replaced, so the file stamp alone
++        // may not tell them apart.
++        public void Handle(EpisodeImportedEvent message)
++        {
++            ForgetProbe(message.EpisodeInfo?.Series?.Path, message.ImportedEpisode?.RelativePath);
++        }
++
++        public void Handle(EpisodeFileDeletedEvent message)
++        {
++            ForgetProbe(message.EpisodeFile?.Path);
++        }
++
++        public void Handle(EpisodeFileRenamedEvent message)
++        {
++            ForgetProbe(message.OriginalPath);
++            ForgetProbe(message.Series?.Path, message.EpisodeFile?.RelativePath);
++        }
++
++        private void ForgetProbe(string folder, string relativePath)
++        {
++            if (folder.IsNotNullOrWhiteSpace() && relativePath.IsNotNullOrWhiteSpace())
++            {
++                ForgetProbe(Path.Combine(folder, relativePath));
++            }
++        }
++
++        private void ForgetProbe(string path)
++        {
++            try
++            {
++                _probeCache.Invalidate(path);
++            }
++            catch (Exception ex)
++            {
++                _logger.Debug(ex, "Unable to drop cached media info for {0}", path);
++            }
++        }
++
+         private bool TryGetFileStamp(string filename, out MediaInfoProbeCache.FileStamp stamp)
+         {
+             try
+-- 
+2.53.0
+

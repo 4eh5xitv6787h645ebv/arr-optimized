@@ -1,0 +1,513 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arr-optimized <arr-optimized@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH 10/10] Bound the housekeeping wait, forget replaced files'
+ ffprobe results, copy release profiles
+
+- Housekeeping still waits until no other command runs, but only for
+  HousekeepingCommand.MaxDeferral (30 minutes) after it was queued. After
+  that it starts like stock: alongside the running commands and not
+  exclusive, so a stuck or very long command cannot keep housekeeping from
+  running forever. A waiting consumer re-checks the queue when the wait
+  runs out. The wait is logged once at Debug, and an overdue housekeeping
+  that starts alongside other commands is logged at Info.
+- Importing, deleting or renaming a movie file drops the ffprobe cache
+  entries for the paths involved, so with "Change File Date" an upgrade at
+  the same path with the same size does not get the old file's media info.
+  A probe that overlapped such an invalidation is not stored.
+- The release profile service hands out copies of the cached profiles, so
+  a caller that changes a returned profile cannot change what later
+  callers see (stock read new objects from the database on every call).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Housekeeping/HousekeepingCommand.cs       |  9 +-
+ .../MediaInfo/MediaInfoProbeCache.cs          | 60 ++++++++++++-
+ .../MediaInfo/VideoFileInfoReader.cs          | 49 ++++++++++-
+ .../Messaging/Commands/CommandQueue.cs        | 84 +++++++++++++++++--
+ .../Releases/ReleaseProfileService.cs         | 62 ++++++++++----
+ 5 files changed, 236 insertions(+), 28 deletions(-)
+
+diff --git a/src/NzbDrone.Core/Housekeeping/HousekeepingCommand.cs b/src/NzbDrone.Core/Housekeeping/HousekeepingCommand.cs
+index 937bf3794..2da4aea0f 100644
+--- a/src/NzbDrone.Core/Housekeeping/HousekeepingCommand.cs
++++ b/src/NzbDrone.Core/Housekeeping/HousekeepingCommand.cs
+@@ -1,9 +1,16 @@
+-﻿using NzbDrone.Core.Messaging.Commands;
++﻿using System;
++using NzbDrone.Core.Messaging.Commands;
+ 
+ namespace NzbDrone.Core.Housekeeping
+ {
+     public class HousekeepingCommand : Command
+     {
++        // Housekeeping waits until no other command runs, so it can VACUUM alone. After waiting this long it starts
++        // anyway and runs alongside other commands, as on stock (CommandQueue.TryGet).
++        public const int MaxDeferralMinutes = 30;
++
++        public static readonly TimeSpan MaxDeferral = TimeSpan.FromMinutes(MaxDeferralMinutes);
++
+         public override bool IsExclusive => true;
+     }
+ }
+diff --git a/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs b/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs
+index 822615feb..148c7af79 100644
+--- a/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs
++++ b/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs
+@@ -1,9 +1,11 @@
+ using System;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
++using System.IO;
+ using System.Linq;
+ using System.Reflection;
+ using System.Threading;
++using NzbDrone.Common.Extensions;
+ using NzbDrone.Core.Optimize;
+ 
+ namespace NzbDrone.Core.MediaFiles.MediaInfo
+@@ -12,8 +14,10 @@ namespace NzbDrone.Core.MediaFiles.MediaInfo
+     // repeatedly (blocked queue items are re-imported every minute, sample detection and aggregation probe
+     // the same file during one import, manual import previews). An entry is used only while the path and the
+     // file stamp (size, last write time and, for a symlink, the last write time of its final target) are
+-    // exactly those seen before and after the probe. Callers get their own copy of the model, never the
+-    // cached instance.
++    // exactly those seen before and after the probe. Entries for a path are also dropped when the app imports,
++    // deletes or renames a file there (Invalidate): with "Change File Date" a new file gets the same last write
++    // time as the file it replaced, so the stamp alone may not tell them apart. Callers get their own copy of
++    // the model, never the cached instance.
+     //
+     // The limits below are the defaults; the limits in effect come from OptimizeSettings.Current.FfprobeCache
+     // (Optimize settings page / environment) and apply to the next lookup or store. ApplyLimits trims at once.
+@@ -58,6 +62,9 @@ internal sealed class MediaInfoProbeCache
+         private long _bytes;
+         private long _lastSweep;
+ 
++        // Incremented by every Invalidate; a probe that overlapped one is not stored (see Add).
++        private long _generation;
++
+         internal long Hits;
+         internal long Misses;
+         internal long Stores;
+@@ -115,6 +122,8 @@ private sealed class Entry
+ 
+         internal long Bytes => Volatile.Read(ref _bytes);
+ 
++        internal long Generation => Interlocked.Read(ref _generation);
++
+         internal bool TryGet(string path, long length, DateTime lastWrite, out MediaInfoModel model)
+         {
+             return TryGet(path, new FileStamp(length, lastWrite), out model);
+@@ -160,7 +169,9 @@ internal void Add(string path, long length, DateTime lastWrite, MediaInfoModel m
+         }
+ 
+         // probeStartedUtc: when the probe whose result this is started; the settle rule is judged at that time.
+-        internal void Add(string path, FileStamp stamp, MediaInfoModel model, DateTime probeStartedUtc)
++        // generation: Generation read before the probe started; if any path was invalidated since, the result is
++        // not stored, so a probe of a file that the app replaced while it ran cannot put the old result back.
++        internal void Add(string path, FileStamp stamp, MediaInfoModel model, DateTime probeStartedUtc, long? generation = null)
+         {
+             var now = Clock();
+             var limits = OptimizeSettings.Current.FfprobeCache;
+@@ -182,6 +193,11 @@ internal void Add(string path, FileStamp stamp, MediaInfoModel model, DateTime p
+ 
+             lock (_writer)
+             {
++                if (generation.HasValue && generation.Value != _generation)
++                {
++                    return;
++                }
++
+                 if (_entries.TryGetValue(path, out var old))
+                 {
+                     Remove(path, old);
+@@ -235,6 +251,44 @@ internal void ApplyLimits()
+             }
+         }
+ 
++        // Drops the entries for this path (compared as the app compares paths, so a different spelling of the same
++        // path is found too). Called when the app imports, deletes or renames a file at the path.
++        internal void Invalidate(string path)
++        {
++            if (path.IsNullOrWhiteSpace())
++            {
++                return;
++            }
++
++            var fileName = Path.GetFileName(path);
++
++            lock (_writer)
++            {
++                _generation++;
++
++                foreach (var pair in _entries)
++                {
++                    if (string.Equals(pair.Key, path, StringComparison.Ordinal) ||
++                        (pair.Key.EndsWith(fileName, StringComparison.OrdinalIgnoreCase) && SamePath(pair.Key, path)))
++                    {
++                        Remove(pair.Key, pair.Value);
++                    }
++                }
++            }
++        }
++
++        private static bool SamePath(string cachedPath, string path)
++        {
++            try
++            {
++                return cachedPath.PathEquals(path);
++            }
++            catch (ArgumentException)
++            {
++                return false;
++            }
++        }
++
+         internal void Clear()
+         {
+             lock (_writer)
+diff --git a/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs b/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs
+index ec791d9b0..a1e10f65f 100644
+--- a/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs
++++ b/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs
+@@ -8,6 +8,8 @@
+ using NLog;
+ using NzbDrone.Common.Disk;
+ using NzbDrone.Common.Extensions;
++using NzbDrone.Core.MediaFiles.Events;
++using NzbDrone.Core.Messaging.Events;
+ using NzbDrone.Core.Optimize;
+ 
+ namespace NzbDrone.Core.MediaFiles.MediaInfo
+@@ -18,7 +20,10 @@ public interface IVideoFileInfoReader
+         TimeSpan? GetRunTime(string filename);
+     }
+ 
+-    public class VideoFileInfoReader : IVideoFileInfoReader
++    public class VideoFileInfoReader : IVideoFileInfoReader,
++        IHandle<MovieFileImportedEvent>,
++        IHandle<MovieFileDeletedEvent>,
++        IHandle<MovieFileRenamedEvent>
+     {
+         private readonly IDiskProvider _diskProvider;
+         private readonly Logger _logger;
+@@ -80,18 +85,58 @@ public MediaInfoModel GetMediaInfo(string filename)
+                 return cachedMediaInfo;
+             }
+ 
++            var generation = _probeCache.Generation;
+             var probeStarted = MediaInfoProbeCache.UtcNow();
+             var mediaInfo = ProbeMediaInfo(filename);
+ 
+             // Remember the result only if the file did not change while it was probed
+             if (TryGetFileStamp(filename, out var stampAfter) && stampAfter.Equals(stamp))
+             {
+-                _probeCache.Add(filename, stamp, mediaInfo, probeStarted);
++                _probeCache.Add(filename, stamp, mediaInfo, probeStarted, generation);
+             }
+ 
+             return mediaInfo;
+         }
+ 
++        // The app put a new file at a path, deleted one or renamed one: forget what was probed at those paths. With
++        // "Change File Date" a new file gets the same last write time as the file it replaced, so the file stamp alone
++        // may not tell them apart.
++        public void Handle(MovieFileImportedEvent message)
++        {
++            ForgetProbe(message.MovieInfo?.Movie?.Path, message.ImportedMovie?.RelativePath);
++        }
++
++        public void Handle(MovieFileDeletedEvent message)
++        {
++            ForgetProbe(message.MovieFile?.Path);
++        }
++
++        public void Handle(MovieFileRenamedEvent message)
++        {
++            ForgetProbe(message.OriginalPath);
++            ForgetProbe(message.Movie?.Path, message.MovieFile?.RelativePath);
++        }
++
++        private void ForgetProbe(string folder, string relativePath)
++        {
++            if (folder.IsNotNullOrWhiteSpace() && relativePath.IsNotNullOrWhiteSpace())
++            {
++                ForgetProbe(Path.Combine(folder, relativePath));
++            }
++        }
++
++        private void ForgetProbe(string path)
++        {
++            try
++            {
++                _probeCache.Invalidate(path);
++            }
++            catch (Exception ex)
++            {
++                _logger.Debug(ex, "Unable to drop cached media info for {0}", path);
++            }
++        }
++
+         private bool TryGetFileStamp(string filename, out MediaInfoProbeCache.FileStamp stamp)
+         {
+             try
+diff --git a/src/NzbDrone.Core/Messaging/Commands/CommandQueue.cs b/src/NzbDrone.Core/Messaging/Commands/CommandQueue.cs
+index 3dbe0c313..128c6d8e2 100644
+--- a/src/NzbDrone.Core/Messaging/Commands/CommandQueue.cs
++++ b/src/NzbDrone.Core/Messaging/Commands/CommandQueue.cs
+@@ -3,15 +3,32 @@
+ using System.Collections.Generic;
+ using System.Linq;
+ using System.Threading;
++using NLog;
++using NzbDrone.Common.Instrumentation;
+ using NzbDrone.Core.Housekeeping;
+ 
+ namespace NzbDrone.Core.Messaging.Commands
+ {
+     public class CommandQueue : IEnumerable
+     {
++        private static readonly TimeSpan MinimumDeferralWait = TimeSpan.FromSeconds(1);
++
++        private static readonly Logger Logger = NzbDroneLogger.GetLogger(typeof(CommandQueue));
++
+         private readonly object _mutex = new object();
+         private readonly List<CommandModel> _items;
+ 
++        // Housekeeping commands that started after waiting HousekeepingCommand.MaxDeferral while other commands ran.
++        // They run like stock: not exclusive.
++        private readonly HashSet<CommandModel> _startedWithoutExclusivity = new HashSet<CommandModel>(ReferenceEqualityComparer.Instance);
++
++        // When a queued housekeeping is held back only because other commands run, the time its wait runs out, so a
++        // waiting consumer re-evaluates the queue then even if nothing else wakes it.
++        private DateTime? _housekeepingDeferredUntil;
++
++        // Queued housekeeping commands whose wait has been logged, so it is logged once per command.
++        private readonly HashSet<CommandModel> _deferralLogged = new HashSet<CommandModel>(ReferenceEqualityComparer.Instance);
++
+         public CommandQueue()
+         {
+             _items = new List<CommandModel>();
+@@ -124,7 +141,16 @@ public IEnumerable<CommandModel> GetConsumingEnumerable(CancellationToken cancel
+ 
+                     if (!TryGet(out command))
+                     {
+-                        Monitor.Wait(_mutex);
++                        if (_housekeepingDeferredUntil.HasValue)
++                        {
++                            var wait = _housekeepingDeferredUntil.Value - DateTime.UtcNow;
++                            Monitor.Wait(_mutex, wait > MinimumDeferralWait ? wait : MinimumDeferralWait);
++                        }
++                        else
++                        {
++                            Monitor.Wait(_mutex);
++                        }
++
+                         continue;
+                     }
+                 }
+@@ -152,6 +178,15 @@ public bool TryGet(out CommandModel item)
+ 
+             lock (_mutex)
+             {
++                var now = DateTime.UtcNow;
++                _housekeepingDeferredUntil = null;
++                _startedWithoutExclusivity.RemoveWhere(c => c.Status != CommandStatus.Started);
++
++                if (_deferralLogged.Count > 0)
++                {
++                    _deferralLogged.RemoveWhere(c => c.Status != CommandStatus.Queued || !_items.Contains(c));
++                }
++
+                 if (_items.Count == 0)
+                 {
+                     rval = false;
+@@ -179,14 +214,31 @@ public bool TryGet(out CommandModel item)
+ 
+                     if (startedCommands.Any(x => x.Body.IsLongRunning))
+                     {
+-                        queuedCommands = queuedCommands.Where(c => !c.Body.IsExclusive);
++                        queuedCommands = queuedCommands.Where(c => !IsExclusiveWhileOthersRun(c, now));
+                     }
+ 
+                     // Housekeeping is exclusive, but while it waits for running commands to finish it must not
+                     // hold back the commands queued after it (e.g. RSS Sync), so it only starts once nothing is running.
++                    // After waiting HousekeepingCommand.MaxDeferral it falls back to stock: it starts while others run
++                    // and is not exclusive, so a stuck or very long command cannot keep housekeeping from running.
+                     if (startedCommands.Any())
+                     {
+-                        queuedCommands = queuedCommands.Where(c => !(c.Body is HousekeepingCommand));
++                        var deferred = _items.Where(c => c.Status == CommandStatus.Queued && c.Body is HousekeepingCommand && !IsOverdueHousekeeping(c, now)).ToList();
++
++                        if (deferred.Any())
++                        {
++                            _housekeepingDeferredUntil = deferred.Min(c => c.QueuedAt) + HousekeepingCommand.MaxDeferral;
++
++                            foreach (var command in deferred.Where(c => _deferralLogged.Add(c)))
++                            {
++                                Logger.Debug("Housekeeping (command {0}) waits for running commands to finish ({1}). It starts anyway {2} minutes after it was queued.",
++                                    command.Id,
++                                    string.Join(", ", startedCommands.Select(c => c.Name)),
++                                    HousekeepingCommand.MaxDeferralMinutes);
++                            }
++
++                            queuedCommands = queuedCommands.Where(c => !deferred.Contains(c));
++                        }
+                     }
+ 
+                     var localItem = queuedCommands.OrderByDescending(c => c.Priority)
+@@ -200,14 +252,14 @@ public bool TryGet(out CommandModel item)
+                     }
+ 
+                     // If any executing command is exclusive don't want return another command until it completes.
+-                    else if (startedCommands.Any(c => c.Body.IsExclusive))
++                    else if (startedCommands.Any(c => c.Body.IsExclusive && !_startedWithoutExclusivity.Contains(c)))
+                     {
+                         rval = false;
+                     }
+ 
+                     // If the next command to execute is exclusive wait for executing commands to complete.
+                     // This will prevent other tasks from starting so the exclusive task executes in the order it should.
+-                    else if (localItem.Body.IsExclusive && startedCommands.Any())
++                    else if (startedCommands.Any() && IsExclusiveWhileOthersRun(localItem, now))
+                     {
+                         rval = false;
+                     }
+@@ -215,6 +267,16 @@ public bool TryGet(out CommandModel item)
+                     // A command ready to execute
+                     else
+                     {
++                        if (localItem.Body.IsExclusive && startedCommands.Any())
++                        {
++                            // Only an overdue housekeeping gets here.
++                            _startedWithoutExclusivity.Add(localItem);
++
++                            Logger.Info("Housekeeping has waited {0} minutes for running commands to finish ({1}). Starting it alongside them, not exclusive.",
++                                HousekeepingCommand.MaxDeferralMinutes,
++                                string.Join(", ", startedCommands.Select(c => c.Name)));
++                        }
++
+                         localItem.StartedAt = DateTime.UtcNow;
+                         localItem.Status = CommandStatus.Started;
+ 
+@@ -225,5 +287,17 @@ public bool TryGet(out CommandModel item)
+ 
+             return rval;
+         }
++
++        // Whether a queued command must wait for running commands to finish because it is exclusive. A housekeeping
++        // that has waited HousekeepingCommand.MaxDeferral does not: it starts alongside them, as on stock.
++        private static bool IsExclusiveWhileOthersRun(CommandModel command, DateTime now)
++        {
++            return command.Body.IsExclusive && !IsOverdueHousekeeping(command, now);
++        }
++
++        private static bool IsOverdueHousekeeping(CommandModel command, DateTime now)
++        {
++            return command.Body is HousekeepingCommand && now - command.QueuedAt >= HousekeepingCommand.MaxDeferral;
++        }
+     }
+ }
+diff --git a/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs b/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
+index b47396ad5..858ff1511 100644
+--- a/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
++++ b/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
+@@ -24,6 +24,8 @@ public class ReleaseProfileService : IReleaseProfileService
+         private readonly Logger _logger;
+ 
+         // The decision engine reads the profiles for every release; they change only through this service.
++        // Callers get their own copies (as stock, which read new objects from the database on every call), so
++        // nothing a caller does to a returned profile can reach the cached list.
+         private readonly object _profilesLock = new();
+         private List<ReleaseProfile> _profiles;
+ 
+@@ -35,36 +37,27 @@ public ReleaseProfileService(IReleaseProfileRepository repo, Logger logger)
+ 
+         public List<ReleaseProfile> All()
+         {
+-            // Cache off (Optimize settings): read every time, as on stock. Every write still clears the cached list, so it
+-            // is never out of date when the cache is turned on again.
+-            if (!OptimizeSettings.Current.ReleaseProfileCache)
+-            {
+-                return _repo.All().ToList();
+-            }
+-
+-            lock (_profilesLock)
+-            {
+-                _profiles ??= _repo.All().ToList();
+-
+-                return _profiles.ToList();
+-            }
++            return Cached().Select(Copy).ToList();
+         }
+ 
+         public List<ReleaseProfile> AllForTag(int tagId)
+         {
+-            return All().Where(r => r.Tags.Contains(tagId)).ToList();
++            return Cached().Where(r => r.Tags.Contains(tagId)).Select(Copy).ToList();
+         }
+ 
+         public List<ReleaseProfile> AllForTags(HashSet<int> tagIds)
+         {
+-            return All().Where(r => r.Tags.Intersect(tagIds).Any() || r.Tags.Empty()).ToList();
++            return Cached().Where(r => MatchesTags(r, tagIds)).Select(Copy).ToList();
+         }
+ 
+         public List<ReleaseProfile> EnabledForTags(HashSet<int> tagIds, int indexerId)
+         {
+-            return AllForTags(tagIds)
++            return Cached()
++                .Where(r => MatchesTags(r, tagIds))
+                 .Where(r => r.Enabled)
+-                .Where(r => r.IndexerId == indexerId || r.IndexerId == 0).ToList();
++                .Where(r => r.IndexerId == indexerId || r.IndexerId == 0)
++                .Select(Copy)
++                .ToList();
+         }
+ 
+         public ReleaseProfile Get(int id)
+@@ -108,6 +101,41 @@ public ReleaseProfile Update(ReleaseProfile restriction)
+             }
+         }
+ 
++        // The shared cached list; never handed out. Cache off (Optimize settings): read every time, as on stock.
++        // Every write still clears the cached list, so it is never out of date when the cache is turned on again.
++        private List<ReleaseProfile> Cached()
++        {
++            if (!OptimizeSettings.Current.ReleaseProfileCache)
++            {
++                return _repo.All().ToList();
++            }
++
++            lock (_profilesLock)
++            {
++                return _profiles ??= _repo.All().ToList();
++            }
++        }
++
++        private static bool MatchesTags(ReleaseProfile profile, HashSet<int> tagIds)
++        {
++            return profile.Tags.Intersect(tagIds).Any() || profile.Tags.Empty();
++        }
++
++        // Every ReleaseProfile member is a value or a string except Required, Ignored and Tags, which are copied.
++        internal static ReleaseProfile Copy(ReleaseProfile profile)
++        {
++            return new ReleaseProfile
++            {
++                Id = profile.Id,
++                Name = profile.Name,
++                Enabled = profile.Enabled,
++                Required = profile.Required?.ToList(),
++                Ignored = profile.Ignored?.ToList(),
++                IndexerId = profile.IndexerId,
++                Tags = profile.Tags == null ? null : new HashSet<int>(profile.Tags, profile.Tags.Comparer)
++            };
++        }
++
+         private void ClearProfiles()
+         {
+             lock (_profilesLock)
+-- 
+2.53.0
+

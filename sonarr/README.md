@@ -1,17 +1,19 @@
 # sonarr-next
 
 A small set of patches for [Sonarr](https://github.com/Sonarr/Sonarr) v5, built as a drop-in
-`Sonarr.Core.dll` on top of the stock linuxserver image. Release decisions are unchanged: the same
+`Sonarr.Core.dll`, `Sonarr.Api.V3.dll` and web UI (`bin/UI`) on top of the stock linuxserver image;
+every other file is stock. The release decision logic is unchanged: given the same inputs, the same
 releases are accepted or rejected for the same reasons, with the same custom formats and scores.
 Patches 0001–0004 make decisions faster; 0005–0010 add an opt-in indexer rate-limit setting,
-smaller speed-ups and fixes for upstream bugs outside the decision path. A fix changes behaviour
-only in the failure case it fixes.
+smaller speed-ups and fixes for upstream bugs outside the decision path; 0011 adds the
+Settings > Optimize page; 0012 makes the ffprobe cache forget files the app replaces. Where a fix
+changes normal operation or the media info that decisions later use, the entry says so.
 
 | | |
 |---|---|
 | Upstream | `v5.0.0.3041` (`03f822c78293981e6e1459fbce59d11476b2107f`, develop) |
 | Base image | `lscr.io/linuxserver/sonarr@sha256:c8c4a3dc…` (`5.0.0.3041-ls212`, the `develop` tag) |
-| Image tag | `sonarr-optimized:5.0.0.3041-next` |
+| Image tag | `sonarr-optimized:5.0.0.3041-next` (local build) |
 | SDK | .NET SDK 10.0.404 (upstream `global.json`) |
 
 ## Patches
@@ -49,7 +51,9 @@ There is no `0002` any more (see below); the numbers of the others are kept so l
      `WaitAndPulseAsync(host, 2 s)` call (pinned by tests).
 
    Example: `-e ARR_INDEXER_RATE_LIMIT_MS=500 -e ARR_INDEXER_CACHE_HIT_HEADER=X-Cache`. The app logs
-   the active settings once, at the first indexer request or grab. Invalid values are logged and ignored.
+   the active settings once, at the first indexer request or grab (an indexer Test from the settings
+   page counts as a request). Invalid values are logged and ignored. `0011` puts the same values (and
+   the grab spacing) on the Optimize page; an environment variable still wins.
 5. `0006` **Faster history total and series statistics.** On SQLite, an unfiltered history page counts
    all rows minus rows whose series or episode is gone, instead of joining both tables (50,000 rows:
    22.0 → 2.6 ms). The total is exactly stock's, including while orphaned rows wait for housekeeping.
@@ -58,17 +62,25 @@ There is no `0002` any more (see below); the numbers of the others are kept so l
    totals through a dictionary instead of a scan per season (54 → 18 ms).
 6. `0007` **ffprobe result cache and timeout.** Media info is reused while the file stamp is unchanged
    before and after the probe: size, last write time and, for a symlink, the final target's path and
-   last write time. At most 1,000 entries and about 32 MiB (estimated), 6 h idle expiry. A probe that
-   runs longer than 5 minutes returns no media info instead of blocking. Differences from stock
-   (failure cases only): a failed probe of a file whose newest write is at least 60 s old is not
-   retried for 10 minutes; a file rewritten in place with the same size and the same modification
-   time (and same symlink target) gets the old media info; results for files written less than 60 s
-   before the probe are reused for 60 s only.
+   last write time. At most 1,000 entries and about 32 MiB (estimated), 6 h idle expiry. All
+   ffprobe runs for one file (the main probe, the longer probe when the audio channel layout is
+   missing, and the frame probe for HDR) share one time limit; when it runs out the running ffprobe
+   is stopped, an error is logged and the file gets no media info, instead of blocking forever.
+   Without media info most files are not imported automatically ("Unable to determine if file is a
+   sample") and the download is retried. The limit was a fixed 5 minutes in this patch; `0011` makes
+   it a setting with a 15-minute default, where 0 calls ffprobe exactly as stock. Differences from
+   stock: a failed probe of a file whose newest write is at least 60 s old is not retried for 10
+   minutes; a file rewritten in place with the same size and the same modification time (and same
+   symlink target) gets the old media info, unless the app itself imported, deleted or renamed a
+   file at that path (`0012` drops the entry then); results for files written less than 60 s before
+   the probe are reused for 60 s only.
 7. `0008` **Import fixes.** An automatic import that throws goes back to `ImportPending` and is retried
    on the next check instead of staying in `Importing` until restart. No back-off: a permanent error
-   is retried about once a minute (each retry runs the whole import, including ffprobe), with one
-   warning and then debug logging. A download whose import mapped zero episodes is no longer treated
-   as already imported (stock marked it Imported and could remove it from the client).
+   is retried about once a minute (each retry runs the whole import; with 0007 an unchanged file is not
+   probed again, and a failed probe of a settled file is repeated at most every 10 minutes), with one
+   warning and then debug logging. A download that is mapped to no episodes (all of its episodes were
+   removed or renumbered) is no longer treated as already imported (stock marked it Imported and could
+   remove it from the client).
 8. `0009` **Scheduler timer per instance.** Stock uses one static timer; every in-process restart
    (Restart button, restore, restart-requiring setting) adds a handler that is never removed, and the
    concurrent handlers can leave the timer dead so scheduled tasks stop. Each Scheduler now owns its
@@ -79,17 +91,86 @@ There is no `0002` any more (see below); the numbers of the others are kept so l
    per (series, path). Known edge: if duplicate rows already exist at the `-orig` path and that file
    is missing, the lookup throws until the housekeeper or the next rescan cleans up.
 
+10. `0011` **Settings > Optimize page** (Core, Api.V3 and the frontend). Adds `/settings/optimize`
+    (sidebar entry after UI and a card on the Settings page) and `GET`/`PUT /api/v3/config/optimize`,
+    `GET /api/v3/config/optimize/settings` and `GET /api/v3/config/optimize/status`. Every
+    adjustable value of `0001`–`0007` becomes a setting (table below). The defaults are the
+    constants of those patches, so with nothing changed the app behaves as with `0001`–`0010`,
+    except that the ffprobe time limit is 15 minutes instead of 5. Values apply on Save without a
+    restart: one immutable settings snapshot is swapped on start-up and on every config save, and
+    the hot paths read it with one volatile read (no database query, no new locks). Cache limits
+    are applied at once under each cache's existing lock (smaller = least recently used entries
+    dropped, off = cleared).
+11. `0012` **Forget replaced files' ffprobe results.** Import, delete and rename events
+    (`EpisodeImportedEvent`, `EpisodeFileDeletedEvent`, `EpisodeFileRenamedEvent`) drop the cache
+    entries for the paths involved, and a probe that overlapped such an event is not stored. With
+    "Change File Date" an upgrade imported to the same path gets the old file's modification time,
+    so a new file of the same size could otherwise get the old file's media info.
+
 Patch `0002` (cache `Database.DatabaseType`) was removed. It had no effect in the running app:
 repositories receive `MainDatabase`, which already reads the type once at startup. Its runner test
 (`Test_DatabaseTypeOpensOnlyOnce`) was removed with it, since stock `Database` intentionally opens a
 connection to read the type.
 
+## Settings > Optimize (patch 0011)
+
+Each value: a valid environment variable wins (the field is read-only on the page), then the value
+saved on the page, then the default. An invalid environment variable is ignored with one warning in
+the log and shown as an error under its field. Saved values are `Config` rows named
+`optimize<Name>`; stock Sonarr ignores them.
+
+| Setting | Environment variable | Default | Allowed | Notes |
+|---|---|---|---|---|
+| Indexer request spacing | `ARR_INDEXER_RATE_LIMIT_MS` | 2000 ms (stock) | page 0–10000, variable 0–86400000 | indexer types with their own limit (BroadcasTheNet: 5000 ms) keep it |
+| Cache hit header | `ARR_INDEXER_CACHE_HIT_HEADER` | empty = off | header name (RFC 9110 token), up to 256 chars | see `0005` |
+| Cache hit value | `ARR_INDEXER_CACHE_HIT_VALUE` | `HIT` | no `,`, `;` or control characters, up to 256 chars | compared without regard to case |
+| ffprobe time limit | `ARR_FFPROBE_TIMEOUT_MINUTES` | 15 min | 0–1440, 0 = no limit | 0 calls `FFProbe.Analyse`/`GetFrames` exactly as stock |
+| Grab spacing | `ARR_GRAB_SPACING_MS` | 2000 ms | 0–60000 | 2000 makes exactly the stock `WaitAndPulseAsync(host, 2 s)` call |
+| Custom-format cache entries | `ARR_CF_CACHE_CAPACITY` | 50000 | 0–1000000, 0 = off | off = the stock evaluation, nothing cached |
+| Custom-format cache lifetime | `ARR_CF_CACHE_LIFETIME_MINUTES` | 360 | 1–10080 | sliding |
+| Custom-format cache input limit | `ARR_CF_CACHE_MAX_KEY_CHARS` | 4096 | 256–65536 | longer inputs are matched without the cache |
+| Custom-format cache sweep | `ARR_CF_CACHE_SWEEP_SECONDS` | 60 | 1–3600 | how often idle entries are dropped |
+| Per-search read memo | `ARR_DECISION_MEMO_ENABLED` | on | `true`/`false` (also yes/no, 1/0, on/off) | off = every lookup reads the database, blocklist uses the stock SQL |
+| ffprobe cache entries | `ARR_FFPROBE_CACHE_CAPACITY` | 1000 | 0–100000, 0 = off | off = no file stamps read, probe as stock |
+| ffprobe cache memory | `ARR_FFPROBE_CACHE_MAX_MB` | 32 | 0–1024, 0 = off | |
+| ffprobe largest result | `ARR_FFPROBE_CACHE_MAX_ENTRY_KB` | 4096 | 1–131072 | capped by the cache memory |
+| ffprobe idle lifetime | `ARR_FFPROBE_CACHE_IDLE_MINUTES` | 360 | 1–10080 | |
+| ffprobe failure lifetime | `ARR_FFPROBE_CACHE_FAILURE_MINUTES` | 10 | 0–10, 0 = not remembered | can only be shorter than `0007`'s |
+| ffprobe settle time | `ARR_FFPROBE_CACHE_SETTLE_SECONDS` | 60 | 60–3600 | can only be longer than `0007`'s |
+| ffprobe recently-written lifetime | `ARR_FFPROBE_CACHE_UNSETTLED_SECONDS` | 60 | 0–60, 0 = not reused | can only be shorter than `0007`'s |
+| ffprobe cache sweep | `ARR_FFPROBE_CACHE_SWEEP_SECONDS` | 60 | 1–3600 | |
+
+The ffprobe cache matches a file on its stamp alone, and a file written less than a minute ago can
+change under an unchanged stamp (coarse timestamps, attribute caches of network shares,
+preallocation). So the settle time, recently-written lifetime and failure lifetime only allow values
+at least as strict as `0007`'s. Read-only rows on the page, each with the reason it is fixed: the
+cache eviction batches, BroadcasTheNet's own limit, the scheduler interval (stock 30 s), the
+failed-import retry (stock 1-minute task), the duplicate extra-file cleanup (stock daily
+housekeeping) and the blocklist `LIKE` pattern limit (50,000 bytes, SQLite's own limit; any other
+value would make the in-memory comparison of `0004` differ from the stock SQL).
+
+API: `GET /api/v3/config/optimize` returns the values (`null` = not saved, the default applies) and
+the full list as `settings`. `PUT` changes only the values present in the body: a value left out
+keeps its saved value, an explicit `null` resets it to the default. Fields locked by an environment
+variable are ignored on `PUT`. Invalid values give HTTP 400 with one error per field. Risk warnings
+are help texts on the page, not validation warnings (the stock API turns any validation warning into
+a 400). The request-wait counters on the Status section only see requests paced by the cache-hit
+limiter (cache-hit header set); with the header off, requests wait inside the stock
+`RateLimitService` in `Sonarr.Common`, which is not rebuilt. The page's texts are English only: the
+translation files are outside the rebuilt assemblies.
+
 ## Build
 
 ```sh
-./build.sh            # clone tag, verify commit, apply patches, build artifacts/Sonarr.Core.dll
+./build.sh            # clone tag, verify commit, apply patches, build artifacts/Sonarr.Core.dll,
+                      # artifacts/Sonarr.Api.V3.dll and artifacts/UI/
 ./build.sh --image    # ...and docker build -t sonarr-optimized:5.0.0.3041-next .
 ```
+
+The UI is built with upstream's own scripts (`yarn install --frozen-lockfile`, `yarn build`), so
+Node.js 24 and yarn 1 are needed (`YARN="corepack yarn" ./build.sh` uses corepack). The
+`Dockerfile` removes the stock `bin/UI` folder (its file names carry content hashes) and copies in
+the two DLLs and the new UI.
 
 Rebasing to a new upstream release: update `upstream.env` (tag, commit, version, base image digest,
 SDK) and the `FROM` line in `Dockerfile`, run `./build.sh`, fix any patch that no longer applies,
@@ -134,15 +215,19 @@ characters and the 50,000-byte pattern limit).
 `tests/CoreTest` holds NUnit fixtures for upstream's own test project (real repositories and test
 database): a deleted indexer during a batch, history, blocklist and episode-file rows written
 during a batch, and in-batch blocklist title matching against the stock SQL query. It also holds one
-folder per later patch (`RateLimit`, `Perf`, `FFprobe`, `Imports`, `Scheduler`, `Extras`), laid out
-like upstream's `src/` so it can be copied in as is: the regression tests for every bug fix (each
-fails on stock and passes with the patch) and the equivalence tests for the speed-ups. See
+folder per later patch (`RateLimit`, `Perf`, `FFprobe`, `Imports`, `Scheduler`, `Extras`,
+`Optimize`, `Polish`), laid out like upstream's `src/` so it can be copied in as is: the regression
+tests for every bug fix (each fails on stock and passes with the patch), the equivalence tests for
+the speed-ups, and the Optimize page's tests (including `NzbDrone.Api.Test` for the controller). See
 `tests/CoreTest/README.md`.
 
 Full-suite result for this release (upstream filter `Category!=ManualTest&Category!=AutomationTest&
 Category!=IntegrationTest&Category!=WINDOWS`, plus `Category!=PerfNextBenchmark`): patched tree with
-every fixture added 5,958 passed, 28 skipped, 0 failed; stock `v5.0.0.3041` 5,725 passed, 27 skipped,
+every fixture added 6,117 passed, 28 skipped, 0 failed; stock `v5.0.0.3041` 5,725 passed, 27 skipped,
 0 failed. The extra skip is the PostgreSQL-only history test, which passes against PostgreSQL 16.
+`Sonarr.Api.Test` with the Optimize controller fixture: 47 passed. `Sonarr.Host.Test`: 24 passed,
+4 skipped (including both container wiring fixtures). The test projects also build with upstream's
+`TreatWarningsAsErrors=true`.
 
 ## Benchmark and equivalence harness
 
@@ -198,4 +283,15 @@ old patch applied cleanly. For the next rebase:
 - **`0009`.** `Scheduler.cs` only; upstream issue #9312 is still open.
 - **`0010`.** The housekeeper file is upstream PR #9338's; the renamer change extends it to the
   missing-file case. When #9338 merges, keep only that extension.
-- Version-pinned: the DLL must only ever be used with the base image of the same Sonarr version.
+- **`0011`.** Mostly new files (`NzbDrone.Core/Optimization`, `Sonarr.Api.V3/Config/Optimize*`,
+  `frontend/src/Settings/Optimize`) plus small edits in the `0001`–`0007` files, which read their
+  limits from `OptimizeSettings.Current` instead of constants (the constants stay as the defaults),
+  and three frontend lines (route, sidebar entry, Settings card). `IConfigService` only gains
+  `GetOptimizeValue`/`SaveOptimizeValues`. `OptimizeSettingsServiceFixture` fails if a constant of
+  those patches is not listed on the page, and `OptimizeSettingBoundsFixture` pins every default and
+  bound. Since the UI is rebuilt, a rebase must rebuild `bin/UI` from the same tag, never mix it
+  with another version's UI.
+- **`0012`.** `VideoFileInfoReader` gains three `IHandle<>` interfaces (additive); keep them on the
+  class that owns `_probeCache`.
+- Version-pinned: the DLLs and the UI must only ever be used with the base image of the same Sonarr
+  version.

@@ -1,2 +1,4 @@
 *
 !artifacts/Sonarr.Core.dll
+!artifacts/Sonarr.Api.V3.dll
+!artifacts/UI

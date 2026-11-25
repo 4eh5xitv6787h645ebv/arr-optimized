@@ -18,7 +18,7 @@ directly). On stock, only the three memo-mechanics tests fail (stock does not me
 `existing_indexer_is_read_once_per_batch_by_find_and_get`, `memo_never_stores_null` and
 `unchanged_rows_are_read_once_per_batch`.
 
-## Fixtures for patches 0005–0010
+## Fixtures for patches 0005–0012
 
 Each folder below mirrors upstream's `src/` folder, so it is copied over the build tree as is.
 
@@ -30,12 +30,16 @@ Each folder below mirrors upstream's `src/` folder, so it is copied over the bui
 | `Imports` | 0008 | `ImportFixes/*`: a throwing import is retried, zero mapped episodes is not "imported" |
 | `Scheduler` | 0009 | `JobTests/SchedulerFixture.cs`; `SchedulerRestartMeasurement.cs` is `[Explicit]` (measurement only) |
 | `Extras` | 0010 | `Extras/Others/*`, `Housekeeping/*` |
+| `Optimize` | 0011 | `OptimizationTests/*` (130 cases): defaults equal the constants of 0001–0007 and stock; every bound; environment > saved > default for every value; saved values applied through the start-up event and on save without a restart; custom-format matches equal the stock evaluation at the smallest, default and largest cache values and while they change; an ffprobe staleness oracle at many settings; ffprobe time limit 0 gives the stock calls and the same media info (real ffprobe); live request and grab timing after saving (real HTTP). `NzbDrone.Api.Test/v3/Config/OptimizeConfigControllerFixture.cs`: GET, PUT round trip, partial PUT, field errors, locked fields |
+| `Polish` | 0012 and earlier patches | `MediaFiles/MediaInfo/VideoFileInfoReaderReplacedFileFixture.cs` and `MediaInfoProbeCacheInvalidationFixture.cs` (0012; uses `FFprobe`'s sample media, so copy `FFprobe` first), `NzbDrone.Host.Test/MediaInfoCacheContainerFixture.cs` (0012 container wiring), `JobTests/SchedulerTimerLifecycleFixture.cs` (0009), `IndexerTests/RateLimitTests/GrabGateHostsFixture.cs` (0005, grabs to two hosts), `PerfNext/HistoryPagedCountQueryFixture.cs` (0006, which count query runs on SQLite and PostgreSQL, without a PostgreSQL server) |
 
 ```sh
-for g in RateLimit Perf FFprobe Imports Scheduler Extras; do cp -r tests/CoreTest/$g/. <tree>/src/; done
+for g in RateLimit Perf FFprobe Imports Scheduler Extras Optimize Polish; do cp -r tests/CoreTest/$g/NzbDrone.* <tree>/src/; done
 cd <tree>
 dotnet build src/NzbDrone.Core.Test/Sonarr.Core.Test.csproj -c Release -p:EnableAnalyzers=false -p:TreatWarningsAsErrors=false
-dotnet test _tests/net10.0/Sonarr.Core.Test.dll --filter "FullyQualifiedName~RateLimitTests|FullyQualifiedName~PerfNext|FullyQualifiedName~MediaFiles.MediaInfo|FullyQualifiedName~ImportFixes|FullyQualifiedName~JobTests.SchedulerFixture|FullyQualifiedName~OtherExtraFileRenamer|FullyQualifiedName~DuplicateExtraFiles"
+dotnet test _tests/net10.0/Sonarr.Core.Test.dll --filter "FullyQualifiedName~RateLimitTests|FullyQualifiedName~PerfNext|FullyQualifiedName~MediaFiles.MediaInfo|FullyQualifiedName~ImportFixes|FullyQualifiedName~JobTests|FullyQualifiedName~OtherExtraFileRenamer|FullyQualifiedName~DuplicateExtraFiles|FullyQualifiedName~OptimizationTests"
+dotnet build src/NzbDrone.Api.Test/Sonarr.Api.Test.csproj -c Release -p:EnableAnalyzers=false -p:TreatWarningsAsErrors=false
+dotnet test _tests/net10.0/Sonarr.Api.Test.dll
 ```
 
 `[Category("PerfNextBenchmark")]` tests are `[Explicit]` timings, not checks. To run the database
@@ -43,7 +47,8 @@ fixtures against PostgreSQL, set `Sonarr__Postgres__Host`, `__Port`, `__User` an
 On PostgreSQL the language-filtered history cases are skipped, because stock's language filter SQL
 does not run there (the same on stock).
 
-The container fixture needs the Host test project and `Sonarr.Mono.dll` next to it:
+The container fixtures (`IndexerRateLimitContainerFixture`, `MediaInfoCacheContainerFixture`) need the
+Host test project and `Sonarr.Mono.dll` next to it:
 
 ```sh
 dotnet build src/NzbDrone.Mono/Sonarr.Mono.csproj -c Release -p:EnableAnalyzers=false
@@ -53,5 +58,6 @@ dotnet test _tests/net10.0/Sonarr.Host.Test.dll
 ```
 
 Some fixtures only compile on a patched tree, because they use the new types
-(`IndexerRateLimitOptions`, `IndexerCacheHitRateLimiter`, `MediaInfoProbeCache`). The others
+(`IndexerRateLimitOptions`, `IndexerCacheHitRateLimiter`, `MediaInfoProbeCache`,
+`NzbDrone.Core.Optimization`). The others
 compile on stock too, which is how the regression tests were shown to fail there.

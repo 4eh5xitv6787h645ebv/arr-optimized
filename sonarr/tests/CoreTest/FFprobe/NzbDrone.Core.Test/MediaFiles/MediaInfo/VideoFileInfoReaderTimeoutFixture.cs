@@ -11,6 +11,7 @@ using Moq;
 using NLog;
 using NUnit.Framework;
 using NzbDrone.Common.Disk;
+using NzbDrone.Common.Instrumentation;
 using NzbDrone.Core.MediaFiles.MediaInfo;
 using NzbDrone.Core.Test.Framework;
 using NzbDrone.Test.Common;
@@ -34,6 +35,15 @@ namespace NzbDrone.Core.Test.MediaFiles.MediaInfo
         private PropertyInfo _timeoutProperty;
         private object _originalTimeout;
         private string _fifo;
+
+        // NzbDroneLogger's static constructor replaces the NLog configuration. When this fixture is the first to run in a
+        // process (a targeted run), that happened after LoggingTest had added the ExceptionVerification target for the
+        // first test, so the errors that test checks were not captured. Initialise it before any SetUp runs.
+        [OneTimeSetUp]
+        public void InitializeLoggerBeforeFirstTest()
+        {
+            NzbDroneLogger.GetLogger(GetType());
+        }
 
         [SetUp]
         public void Setup()
@@ -81,10 +91,10 @@ namespace NzbDrone.Core.Test.MediaFiles.MediaInfo
         }
 
         [Test]
-        public void default_probe_timeout_should_be_five_minutes()
+        public void default_probe_timeout_should_be_fifteen_minutes()
         {
             _timeoutProperty.Should().NotBeNull("the probe timeout exists");
-            _originalTimeout.Should().Be(TimeSpan.FromMinutes(5));
+            _originalTimeout.Should().Be(TimeSpan.FromMinutes(15));
         }
 
         [Test]

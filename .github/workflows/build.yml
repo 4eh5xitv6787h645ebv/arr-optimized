@@ -11,7 +11,87 @@ permissions:
   packages: write
 
 jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - app: sonarr
+            name: Sonarr
+            fixtures: tests/CoreTest
+            groups: RateLimit Perf FFprobe Imports Scheduler Extras Optimize Polish
+          - app: radarr
+            name: Radarr
+            fixtures: tests/UpstreamFixtures
+            groups: RateLimit Perf FFprobe Imports Scheduler Extras RadarrDb Optimize Polish
+    defaults:
+      run:
+        working-directory: ${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.404
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+
+      - name: Patched source tree
+        run: |
+          corepack enable
+          # Same clone, verify, patch and build as for the image; the tree is kept for the tests.
+          if [ "${{ matrix.app }}" = sonarr ]; then
+            BUILD_DIR="$RUNNER_TEMP/b" ./build.sh
+            echo "TREE=$RUNNER_TEMP/b/Sonarr" >> "$GITHUB_ENV"
+          else
+            WORK="$RUNNER_TEMP/b" ./build.sh --no-image
+            echo "TREE=$RUNNER_TEMP/b/src" >> "$GITHUB_ENV"
+          fi
+
+      - name: Add the NUnit fixtures
+        run: |
+          # Each group folder mirrors upstream's src/. Polish uses FFprobe's sample media, so it comes after it.
+          for g in ${{ matrix.groups }}; do cp -r "${{ matrix.fixtures }}/$g"/NzbDrone.* "$TREE/src/"; done
+          # Decision-equivalence regressions, placed as the tests READMEs say.
+          # Never copy sonarr/tests/CoreTest/stock-stub: it is for stock trees only.
+          if [ "${{ matrix.app }}" = sonarr ]; then
+            cp -r tests/CoreTest/SonarrNext "$TREE/src/NzbDrone.Core.Test/"
+          else
+            mkdir -p "$TREE/src/NzbDrone.Core.Test/ReviewFixes"
+            cp tests/UpstreamFixtures/*.cs "$TREE/src/NzbDrone.Core.Test/ReviewFixes/"
+          fi
+
+      - name: Build tests
+        working-directory: ${{ env.TREE }}
+        run: |
+          f=(-c Release -p:EnableAnalyzers=false -p:TreatWarningsAsErrors=false -p:RuntimeIdentifiers=linux-musl-x64)
+          dotnet build src/NzbDrone.Core.Test/${{ matrix.name }}.Core.Test.csproj "${f[@]}"
+          dotnet build src/NzbDrone.Api.Test/${{ matrix.name }}.Api.Test.csproj "${f[@]}"
+          dotnet build src/NzbDrone.Mono/${{ matrix.name }}.Mono.csproj "${f[@]}"
+          dotnet build src/NzbDrone.Host.Test/${{ matrix.name }}.Host.Test.csproj "${f[@]}"
+          cp _output/net10.0/${{ matrix.name }}.Mono.dll _tests/net10.0/
+
+      - name: Core tests (upstream suite and every fixture above)
+        working-directory: ${{ env.TREE }}
+        run: >
+          dotnet test _tests/net10.0/${{ matrix.name }}.Core.Test.dll
+          --filter "Category!=ManualTest&Category!=AutomationTest&Category!=IntegrationTest&Category!=WINDOWS&Category!=PerfNextBenchmark"
+
+      - name: API tests (upstream suite and the Optimize controller fixture)
+        working-directory: ${{ env.TREE }}
+        run: dotnet test _tests/net10.0/${{ matrix.name }}.Api.Test.dll
+
+      - name: Container wiring fixtures
+        working-directory: ${{ env.TREE }}
+        run: >
+          dotnet test _tests/net10.0/${{ matrix.name }}.Host.Test.dll
+          --filter "FullyQualifiedName~IndexerRateLimitContainerFixture|FullyQualifiedName~MediaInfoCacheContainerFixture"
+
   image:
+    needs: [tests]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -27,6 +107,10 @@ jobs:
         with:
           dotnet-version: 10.0.404
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+
       - name: Read pins
         id: pins
         run: |
@@ -35,8 +119,9 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "base=$BASE_IMAGE" >> "$GITHUB_OUTPUT"
 
-      - name: Build patched core DLL from upstream source
+      - name: Build patched Core, Api.V3 and UI from upstream source
         run: |
+          corepack enable
           if [ "${{ matrix.app }}" = sonarr ]; then ./build.sh; else ./build.sh --no-image; fi
           cat artifacts/*.sha256 | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -58,6 +143,9 @@ jobs:
         run: |
           bin=$GITHUB_WORKSPACE/radarr/radarr-bin
           dotnet run -c Release -p:CoreBin="$GITHUB_WORKSPACE/radarr/artifacts" -p:StockBin="$bin" -- "$bin"
+
+      # The Dockerfile removes the stock UI folder (RUN), which needs emulation for the arm64 image.
+      - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
 
@@ -83,4 +171,4 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.pins.outputs.version }}
             org.opencontainers.image.licenses=GPL-3.0-only
-            org.opencontainers.image.description=Stock linuxserver ${{ matrix.app }} with a patched ${{ matrix.app }} core DLL (faster release decisions, same results)
+            org.opencontainers.image.description=Stock linuxserver ${{ matrix.app }} with patched ${{ matrix.app }} core and API DLLs and web UI (faster release decisions, same decisions; plus fixes and an Optimize settings page, see README)

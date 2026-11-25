@@ -1,0 +1,3947 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arr-optimized <arr-optimized@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:00 +0000
+Subject: [PATCH 09/10] Optimize settings page: every optimization value
+ adjustable, live, with status
+
+Adds Settings > Optimize (/settings/optimize), GET/PUT /api/v3/config/optimize,
+GET /api/v3/config/optimize/settings and GET /api/v3/config/optimize/status.
+
+- Main settings: indexer request spacing (0-10000 ms, empty = stock 2000 ms),
+  cache hit header/value, ffprobe timeout (0-1440 min, default 15, 0 = none).
+- Advanced tuning: grab spacing, custom-format cache entries/expiry/max input
+  length, per-search indexer memo, release profile cache, and every ffprobe
+  cache limit (entries, MB, max result KB, failure/idle/recently-written
+  lifetimes, settle time, sweep interval), each with bounds, a warning range
+  and Reset to default.
+- Values are stored in the Config table ("optimize..." keys). A valid
+  ARR_* environment variable wins and locks the field (PUT ignores it);
+  otherwise the saved value; otherwise the default. Invalid values -> 400
+  with field errors (numbers are long, so too-large numbers get the same
+  field error). PUT changes only the values it carries (missing/null =
+  unchanged, like the other config endpoints); the default value resets.
+- OptimizeSettings is an immutable snapshot swapped on Save/ConfigSavedEvent;
+  hot paths do one volatile read. Cache limits apply at once under each
+  cache's own lock; 0 turns a cache off and takes the uncached path.
+- Defaults equal the previous constants (stock timing, same caches), except
+  the ffprobe timeout default, which rises from 5 to 15 minutes.
+- Status: built-in optimizations and Interlocked counters (CF cache,
+  ffprobe cache, ffprobe timeouts, cache-hit refunds, paced waits).
+- The settings list shows the value in effect (max ffprobe result size is
+  capped by the cache memory limit, with a note).
+- UI: number fields carry the API bounds; a 400 that is not a list of field
+  errors is shown as an error instead of breaking the page.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ frontend/src/App/AppRoutes.tsx                |   3 +
+ frontend/src/App/State/SettingsAppState.ts    |   6 +
+ .../Components/Page/Sidebar/PageSidebar.tsx   |   4 +
+ .../src/Settings/Optimize/OptimizeField.tsx   | 202 +++++++
+ .../Settings/Optimize/OptimizeSettings.css    | 207 +++++++
+ .../Optimize/OptimizeSettings.css.d.ts        |  38 ++
+ .../Settings/Optimize/OptimizeSettings.tsx    | 233 ++++++++
+ .../Optimize/OptimizeSettingsList.tsx         | 138 +++++
+ .../Optimize/OptimizeStatusSection.tsx        |  94 ++++
+ .../Settings/Optimize/formatOptimizeValue.ts  |  69 +++
+ frontend/src/Settings/Settings.tsx            |   9 +
+ .../src/Store/Actions/Settings/optimize.js    |  64 +++
+ frontend/src/Store/Actions/settingsActions.js |   5 +
+ .../src/Store/Selectors/selectSettings.ts     |  26 +
+ .../src/typings/Settings/OptimizeSettings.ts  |  80 +++
+ .../Configuration/ConfigService.cs            |  53 ++
+ .../Configuration/IConfigService.cs           |   9 +
+ .../CustomFormats/CustomFormatMatchCache.cs   |  99 +++-
+ .../DecisionEngine/DecisionBatchCache.cs      |   5 +-
+ .../Indexers/IndexerCacheHitRateLimiter.cs    |  16 +
+ .../Indexers/IndexerRateLimitOptions.cs       |  69 ++-
+ .../MediaInfo/MediaInfoProbeCache.cs          |  68 ++-
+ .../MediaInfo/VideoFileInfoReader.cs          |  53 +-
+ .../Optimize/OptimizeCounters.cs              |  44 ++
+ .../Optimize/OptimizeSettings.cs              | 368 +++++++++++++
+ .../Optimize/OptimizeSettingsService.cs       | 412 ++++++++++++++
+ src/NzbDrone.Core/Optimize/OptimizeTunable.cs | 179 ++++++
+ .../Optimize/OptimizeTunables.cs              | 510 ++++++++++++++++++
+ .../Releases/ReleaseProfileService.cs         |   8 +
+ .../Config/OptimizeConfigController.cs        |  63 +++
+ .../Config/OptimizeConfigResource.cs          |  80 +++
+ .../Config/OptimizeConfigResourceValidator.cs |  24 +
+ 32 files changed, 3163 insertions(+), 75 deletions(-)
+ create mode 100644 frontend/src/Settings/Optimize/OptimizeField.tsx
+ create mode 100644 frontend/src/Settings/Optimize/OptimizeSettings.css
+ create mode 100644 frontend/src/Settings/Optimize/OptimizeSettings.css.d.ts
+ create mode 100644 frontend/src/Settings/Optimize/OptimizeSettings.tsx
+ create mode 100644 frontend/src/Settings/Optimize/OptimizeSettingsList.tsx
+ create mode 100644 frontend/src/Settings/Optimize/OptimizeStatusSection.tsx
+ create mode 100644 frontend/src/Settings/Optimize/formatOptimizeValue.ts
+ create mode 100644 frontend/src/Store/Actions/Settings/optimize.js
+ create mode 100644 frontend/src/typings/Settings/OptimizeSettings.ts
+ create mode 100644 src/NzbDrone.Core/Optimize/OptimizeCounters.cs
+ create mode 100644 src/NzbDrone.Core/Optimize/OptimizeSettings.cs
+ create mode 100644 src/NzbDrone.Core/Optimize/OptimizeSettingsService.cs
+ create mode 100644 src/NzbDrone.Core/Optimize/OptimizeTunable.cs
+ create mode 100644 src/NzbDrone.Core/Optimize/OptimizeTunables.cs
+ create mode 100644 src/Radarr.Api.V3/Config/OptimizeConfigController.cs
+ create mode 100644 src/Radarr.Api.V3/Config/OptimizeConfigResource.cs
+ create mode 100644 src/Radarr.Api.V3/Config/OptimizeConfigResourceValidator.cs
+
+diff --git a/frontend/src/App/AppRoutes.tsx b/frontend/src/App/AppRoutes.tsx
+index b7da99915..0bec3425e 100644
+--- a/frontend/src/App/AppRoutes.tsx
++++ b/frontend/src/App/AppRoutes.tsx
+@@ -20,6 +20,7 @@ import IndexerSettings from 'Settings/Indexers/IndexerSettings';
+ import MediaManagement from 'Settings/MediaManagement/MediaManagement';
+ import MetadataSettings from 'Settings/Metadata/MetadataSettings';
+ import NotificationSettings from 'Settings/Notifications/NotificationSettings';
++import OptimizeSettings from 'Settings/Optimize/OptimizeSettings';
+ import Profiles from 'Settings/Profiles/Profiles';
+ import QualityConnector from 'Settings/Quality/QualityConnector';
+ import Settings from 'Settings/Settings';
+@@ -129,6 +130,8 @@ function AppRoutes() {
+ 
+       <Route path="/settings/ui" component={UISettingsConnector} />
+ 
++      <Route path="/settings/optimize" component={OptimizeSettings} />
++
+       {/*
+         System
+       */}
+diff --git a/frontend/src/App/State/SettingsAppState.ts b/frontend/src/App/State/SettingsAppState.ts
+index a970afb8b..d90836880 100644
+--- a/frontend/src/App/State/SettingsAppState.ts
++++ b/frontend/src/App/State/SettingsAppState.ts
+@@ -23,6 +23,7 @@ import IndexerOptions from 'typings/Settings/IndexerOptions';
+ import MediaManagement from 'typings/Settings/MediaManagement';
+ import NamingConfig from 'typings/Settings/NamingConfig';
+ import NamingExample from 'typings/Settings/NamingExample';
++import OptimizeSettings from 'typings/Settings/OptimizeSettings';
+ import ReleaseProfile from 'typings/Settings/ReleaseProfile';
+ import UiSettings from 'typings/Settings/UiSettings';
+ import MetadataAppState from './MetadataAppState';
+@@ -62,6 +63,10 @@ export interface MediaManagementAppState
+   extends AppSectionItemState<MediaManagement>,
+     AppSectionSaveState {}
+ 
++export interface OptimizeAppState
++  extends AppSectionItemState<OptimizeSettings>,
++    AppSectionSaveState {}
++
+ export interface NamingAppState
+   extends AppSectionItemState<NamingConfig>,
+     AppSectionSaveState {}
+@@ -143,6 +148,7 @@ interface SettingsAppState {
+   naming: NamingAppState;
+   namingExamples: NamingExamplesAppState;
+   notifications: NotificationAppState;
++  optimize: OptimizeAppState;
+   qualityProfiles: QualityProfilesAppState;
+   releaseProfiles: ReleaseProfilesAppState;
+   ui: UiSettingsAppState;
+diff --git a/frontend/src/Components/Page/Sidebar/PageSidebar.tsx b/frontend/src/Components/Page/Sidebar/PageSidebar.tsx
+index f64473c31..5261f50fb 100644
+--- a/frontend/src/Components/Page/Sidebar/PageSidebar.tsx
++++ b/frontend/src/Components/Page/Sidebar/PageSidebar.tsx
+@@ -165,6 +165,10 @@ const LINKS: SidebarItem[] = [
+         title: () => translate('Ui'),
+         to: '/settings/ui',
+       },
++      {
++        title: 'Optimize',
++        to: '/settings/optimize',
++      },
+     ],
+   },
+ 
+diff --git a/frontend/src/Settings/Optimize/OptimizeField.tsx b/frontend/src/Settings/Optimize/OptimizeField.tsx
+new file mode 100644
+index 000000000..a695febe6
+--- /dev/null
++++ b/frontend/src/Settings/Optimize/OptimizeField.tsx
+@@ -0,0 +1,202 @@
++import React, { useCallback } from 'react';
++import FormGroup from 'Components/Form/FormGroup';
++import FormInputButton from 'Components/Form/FormInputButton';
++import FormInputGroup from 'Components/Form/FormInputGroup';
++import FormLabel from 'Components/Form/FormLabel';
++import Icon from 'Components/Icon';
++import Label from 'Components/Label';
++import { icons, inputTypes, kinds } from 'Helpers/Props';
++import { InputChanged } from 'typings/inputs';
++import { Pending } from 'typings/pending';
++import {
++  OptimizeSettingInfo,
++  OptimizeValue,
++} from 'typings/Settings/OptimizeSettings';
++import formatOptimizeValue, {
++  formatNumber,
++  isRiskyValue,
++} from './formatOptimizeValue';
++import styles from './OptimizeSettings.css';
++
++interface OptimizeFieldProps {
++  tunable: OptimizeSettingInfo;
++  setting?: Pending<OptimizeValue>;
++  onInputChange: (change: InputChanged) => void;
++}
++
++function OptimizeField({
++  tunable,
++  setting,
++  onInputChange,
++}: OptimizeFieldProps) {
++  const {
++    name,
++    label,
++    kind,
++    unit,
++    min,
++    max,
++    locked,
++    defaultValue,
++    environmentVariable,
++    environmentValue,
++    environmentError,
++    zeroMeans,
++    note,
++  } = tunable;
++
++  const isBoolean = kind === 'boolean';
++  const value = setting?.value ?? null;
++  const effectiveValue = value ?? defaultValue;
++  const isPending = !!setting?.pending;
++  const isDefault = isBoolean
++    ? effectiveValue === defaultValue
++    : value == null || value === defaultValue;
++
++  const handleResetPress = useCallback(() => {
++    onInputChange({ name, value: isBoolean ? defaultValue : null });
++  }, [name, isBoolean, defaultValue, onInputChange]);
++
++  let bounds = '';
++
++  if (kind === 'integer' && min != null && max != null) {
++    bounds = ` Allowed: ${formatNumber(min)} to ${formatNumber(max)}${
++      unit ? ` ${unit}` : ''
++    }${zeroMeans ? ` (0 = ${zeroMeans})` : ''}.`;
++  }
++
++  const defaultText = `Default: ${formatOptimizeValue(
++    tunable,
++    defaultValue
++  )}.${bounds}`;
++
++  let sourceText = `Source: ${tunable.sourceText.toLowerCase()}.`;
++
++  if (note && !isPending) {
++    sourceText = `${sourceText} ${note}`;
++  }
++
++  if (locked) {
++    sourceText = `Set by environment variable ${environmentVariable} (read-only here; change or remove it on the container and recreate it).${
++      note ? ` ${note}` : ''
++    }`;
++  } else if (isPending) {
++    sourceText = 'Not saved yet.';
++  } else if (environmentVariable) {
++    sourceText = `Source: ${tunable.sourceText.toLowerCase()}. Environment variable: ${environmentVariable}.`;
++  }
++
++  const warnings: string[] = [];
++
++  if (isRiskyValue(tunable, effectiveValue) && tunable.warning) {
++    warnings.push(tunable.warning);
++  }
++
++  if (environmentError) {
++    warnings.push(
++      `${environmentVariable}='${environmentValue}' is ignored: ${environmentError}.`
++    );
++  }
++
++  let placeholder: string | undefined = undefined;
++
++  if (kind === 'text') {
++    placeholder =
++      defaultValue === ''
++        ? 'Empty = off (default)'
++        : `${defaultValue} (default)`;
++  } else if (kind === 'integer' && typeof defaultValue === 'number') {
++    placeholder = `${defaultValue} (default)`;
++  }
++
++  const resetButton =
++    locked || isDefault ? null : (
++      <FormInputButton
++        key="reset"
++        kind={kinds.DEFAULT}
++        title="Reset to default"
++        onPress={handleResetPress}
++      >
++        <Icon name={icons.RESTORE} />
++      </FormInputButton>
++    );
++
++  const helpTextWarning = warnings.length ? warnings.join(' ') : undefined;
++  const buttons = resetButton ? [resetButton] : [];
++  let input = null;
++
++  if (isBoolean) {
++    input = (
++      <FormInputGroup
++        type={inputTypes.CHECK}
++        name={name}
++        value={effectiveValue as boolean}
++        isDisabled={locked}
++        helpText={`${tunable.description} ${defaultText} ${sourceText}`}
++        helpTextWarning={helpTextWarning}
++        buttons={buttons}
++        errors={setting?.errors}
++        warnings={setting?.warnings}
++        onChange={onInputChange}
++      />
++    );
++  } else if (kind === 'integer') {
++    input = (
++      <FormInputGroup
++        type={inputTypes.NUMBER}
++        name={name}
++        value={value as number | null}
++        min={min ?? undefined}
++        max={max ?? undefined}
++        unit={unit}
++        placeholder={placeholder}
++        readOnly={locked}
++        helpText={tunable.description}
++        helpTexts={[defaultText, sourceText]}
++        helpTextWarning={helpTextWarning}
++        buttons={buttons}
++        errors={setting?.errors}
++        warnings={setting?.warnings}
++        onChange={onInputChange}
++      />
++    );
++  } else {
++    input = (
++      <FormInputGroup
++        type={inputTypes.TEXT}
++        name={name}
++        value={(value as string | null) ?? ''}
++        placeholder={placeholder}
++        readOnly={locked}
++        helpText={tunable.description}
++        helpTexts={[defaultText, sourceText]}
++        helpTextWarning={helpTextWarning}
++        buttons={buttons}
++        errors={setting?.errors}
++        warnings={setting?.warnings}
++        onChange={onInputChange}
++      />
++    );
++  }
++
++  return (
++    <FormGroup>
++      <FormLabel>
++        {label}
++        {locked ? (
++          <Label
++            className={styles.lockedLabel}
++            kind={kinds.WARNING}
++            title={`Set by environment variable ${environmentVariable}`}
++          >
++            ENV
++          </Label>
++        ) : null}
++      </FormLabel>
++
++      {input}
++    </FormGroup>
++  );
++}
++
++export default OptimizeField;
+diff --git a/frontend/src/Settings/Optimize/OptimizeSettings.css b/frontend/src/Settings/Optimize/OptimizeSettings.css
+new file mode 100644
+index 000000000..bd4ec723a
+--- /dev/null
++++ b/frontend/src/Settings/Optimize/OptimizeSettings.css
+@@ -0,0 +1,207 @@
++.lockedLabel {
++  composes: label from '~Components/Label.css';
++
++  margin-left: 6px;
++  height: fit-content;
++}
++
++.subheading {
++  margin: 25px 0 15px;
++  padding-bottom: 5px;
++  border-bottom: 1px solid var(--borderColor);
++  color: var(--helpTextColor);
++  font-weight: bold;
++  font-size: $largeFontSize;
++}
++
++.list {
++  font-size: $defaultFontSize;
++}
++
++.listIntro {
++  margin-bottom: 15px;
++  color: var(--helpTextColor);
++}
++
++.listSection {
++  margin-bottom: 25px;
++}
++
++.listSectionTitle {
++  margin: 20px 0 8px;
++  font-weight: bold;
++  font-size: $largeFontSize;
++}
++
++.listHeader,
++.row {
++  display: grid;
++  grid-template-columns: minmax(160px, 1.4fr) minmax(90px, 0.7fr) minmax(90px, 0.7fr) minmax(200px, 2.2fr);
++  gap: 12px;
++
++  padding: 8px 0;
++  border-bottom: 1px solid var(--borderColor);
++}
++
++.listHeader {
++  color: var(--helpTextColor);
++  font-weight: bold;
++  font-size: $smallFontSize;
++}
++
++.rowName {
++  font-weight: bold;
++}
++
++.rowDescription,
++.rowMeta {
++  color: var(--helpTextColor);
++  font-size: $smallFontSize;
++  overflow-wrap: anywhere;
++}
++
++.rowDescription {
++  margin-top: 3px;
++}
++
++.rowValue {
++  overflow-wrap: anywhere;
++}
++
++.rowSource {
++  color: var(--textColor);
++  font-weight: bold;
++}
++
++.changed {
++  font-weight: bold;
++}
++
++.risky {
++  color: var(--warningColor);
++}
++
++.locked {
++  color: var(--warningColor);
++}
++
++.code {
++  font-family: $monoSpaceFontFamily;
++}
++
++.cellLabel {
++  display: none;
++}
++
++.statusHeader {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  flex-wrap: wrap;
++  margin-bottom: 15px;
++  gap: 10px;
++}
++
++.statusStarted {
++  color: var(--helpTextColor);
++}
++
++.counters {
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
++  gap: 10px;
++}
++
++.counter {
++  padding: 10px;
++  border: 1px solid var(--borderColor);
++  border-radius: 4px;
++  background-color: var(--cardBackgroundColor);
++}
++
++.counterValue {
++  font-weight: bold;
++  font-size: 20px;
++}
++
++.counterUnit {
++  color: var(--helpTextColor);
++  font-weight: normal;
++  font-size: $defaultFontSize;
++}
++
++.counterLabel {
++  color: var(--helpTextColor);
++  font-size: $smallFontSize;
++}
++
++.features {
++  margin: 0;
++  padding: 0;
++  list-style: none;
++}
++
++.feature {
++  display: grid;
++  grid-template-columns: 12px minmax(160px, 1fr) minmax(140px, 1fr) 2fr;
++  gap: 10px;
++
++  padding: 7px 0;
++  border-bottom: 1px solid var(--borderColor);
++}
++
++.dot {
++  display: inline-block;
++  margin-top: 6px;
++  width: 10px;
++  height: 10px;
++  border-radius: 50%;
++  background-color: var(--disabledColor);
++}
++
++.dotActive {
++  background-color: var(--successColor);
++}
++
++.featureName {
++  font-weight: bold;
++}
++
++.featureState {
++  overflow-wrap: anywhere;
++}
++
++.featureDescription {
++  color: var(--helpTextColor);
++  font-size: $smallFontSize;
++}
++
++@media only screen and (max-width: $breakpointSmall) {
++  .listHeader {
++    display: none;
++  }
++
++  .row {
++    display: block;
++  }
++
++  .row > div {
++    margin-bottom: 4px;
++  }
++
++  .cellLabel {
++    display: inline;
++    margin-right: 5px;
++    color: var(--helpTextColor);
++    font-weight: normal;
++  }
++
++  .feature {
++    grid-template-columns: 12px 1fr;
++  }
++
++  .featureState,
++  .featureDescription {
++    grid-column: 2;
++  }
++}
+diff --git a/frontend/src/Settings/Optimize/OptimizeSettings.css.d.ts b/frontend/src/Settings/Optimize/OptimizeSettings.css.d.ts
+new file mode 100644
+index 000000000..f26284e6e
+--- /dev/null
++++ b/frontend/src/Settings/Optimize/OptimizeSettings.css.d.ts
+@@ -0,0 +1,38 @@
++// This file is automatically generated.
++// Please do not change this file!
++interface CssExports {
++  'cellLabel': string;
++  'changed': string;
++  'code': string;
++  'counter': string;
++  'counterLabel': string;
++  'counterUnit': string;
++  'counterValue': string;
++  'counters': string;
++  'dot': string;
++  'dotActive': string;
++  'feature': string;
++  'featureDescription': string;
++  'featureName': string;
++  'featureState': string;
++  'features': string;
++  'list': string;
++  'listHeader': string;
++  'listIntro': string;
++  'listSection': string;
++  'listSectionTitle': string;
++  'locked': string;
++  'lockedLabel': string;
++  'risky': string;
++  'row': string;
++  'rowDescription': string;
++  'rowMeta': string;
++  'rowName': string;
++  'rowSource': string;
++  'rowValue': string;
++  'statusHeader': string;
++  'statusStarted': string;
++  'subheading': string;
++}
++export const cssExports: CssExports;
++export default cssExports;
+diff --git a/frontend/src/Settings/Optimize/OptimizeSettings.tsx b/frontend/src/Settings/Optimize/OptimizeSettings.tsx
+new file mode 100644
+index 000000000..8a759ed9f
+--- /dev/null
++++ b/frontend/src/Settings/Optimize/OptimizeSettings.tsx
+@@ -0,0 +1,233 @@
++import React, { useCallback, useEffect, useMemo } from 'react';
++import { useDispatch, useSelector } from 'react-redux';
++import AppState from 'App/State/AppState';
++import Alert from 'Components/Alert';
++import FieldSet from 'Components/FieldSet';
++import Form from 'Components/Form/Form';
++import LoadingIndicator from 'Components/Loading/LoadingIndicator';
++import PageContent from 'Components/Page/PageContent';
++import PageContentBody from 'Components/Page/PageContentBody';
++import useApiQuery from 'Helpers/Hooks/useApiQuery';
++import usePrevious from 'Helpers/Hooks/usePrevious';
++import { kinds } from 'Helpers/Props';
++import SettingsToolbar from 'Settings/SettingsToolbar';
++import { clearPendingChanges } from 'Store/Actions/baseActions';
++import {
++  fetchOptimizeSettings,
++  saveOptimizeSettings,
++  setOptimizeSettingsValue,
++} from 'Store/Actions/settingsActions';
++import createSettingsSectionSelector from 'Store/Selectors/createSettingsSectionSelector';
++import { InputChanged } from 'typings/inputs';
++import { Pending } from 'typings/pending';
++import {
++  OptimizeSettingInfo,
++  OptimizeStatus,
++  OptimizeValue,
++} from 'typings/Settings/OptimizeSettings';
++import OptimizeField from './OptimizeField';
++import OptimizeSettingsList from './OptimizeSettingsList';
++import OptimizeStatusSection from './OptimizeStatusSection';
++import styles from './OptimizeSettings.css';
++
++const SECTION = 'optimize';
++
++function OptimizeSettings() {
++  const dispatch = useDispatch();
++
++  const {
++    isFetching,
++    isPopulated,
++    isSaving,
++    error,
++    saveError,
++    settings,
++    hasSettings,
++    hasPendingChanges,
++    validationErrors,
++    validationWarnings,
++  } = useSelector(createSettingsSectionSelector(SECTION));
++
++  const {
++    data: status,
++    isFetching: isFetchingStatus,
++    isError: hasStatusError,
++    refetch: refetchStatus,
++  } = useApiQuery<OptimizeStatus>({
++    path: '/config/optimize/status',
++    queryOptions: {
++      refetchOnWindowFocus: false,
++    },
++  });
++
++  const item = useSelector(
++    (state: AppState) => state.settings.optimize.item
++  ) as unknown as Record<string, OptimizeValue | undefined>;
++
++  const pendingChanges = useSelector(
++    (state: AppState) => state.settings.optimize.pendingChanges
++  ) as unknown as Record<string, OptimizeValue | undefined>;
++
++  const wasSaving = usePrevious(isSaving);
++
++  const tunables: OptimizeSettingInfo[] = useMemo(() => {
++    return settings.tunables?.value ?? [];
++  }, [settings.tunables]);
++
++  const mainTunables = useMemo(
++    () => tunables.filter((t) => t.editable && t.main),
++    [tunables]
++  );
++
++  const advancedSections = useMemo(() => {
++    const sections: [string, OptimizeSettingInfo[]][] = [];
++
++    tunables
++      .filter((t) => t.editable && !t.main)
++      .forEach((tunable) => {
++        const existing = sections.find(([name]) => name === tunable.section);
++
++        if (existing) {
++          existing[1].push(tunable);
++        } else {
++          sections.push([tunable.section, [tunable]]);
++        }
++      });
++
++    return sections;
++  }, [tunables]);
++
++  const handleInputChange = useCallback(
++    (change: InputChanged) => {
++      // The API leaves out values that are not set (null). Clearing a field, or resetting it to its
++      // default, gives back that same "not set" value, so it is not an unsaved change.
++      const value =
++        change.value == null && item[change.name] == null
++          ? item[change.name]
++          : change.value;
++
++      // @ts-expect-error - actions aren't typed
++      dispatch(setOptimizeSettingsValue({ ...change, value }));
++    },
++    [item, dispatch]
++  );
++
++  const handleSavePress = useCallback(() => {
++    // The API leaves a missing or empty value unchanged (like the other config endpoints), so a field that was
++    // cleared or reset on this page is sent as its default value, which clears the saved value.
++    const payload: Record<string, OptimizeValue> = {};
++
++    Object.keys(pendingChanges ?? {}).forEach((name) => {
++      const value = pendingChanges[name];
++      const tunable = tunables.find((t) => t.name === name);
++
++      if (tunable && (value == null || value === '')) {
++        payload[name] = tunable.defaultValue;
++      }
++    });
++
++    dispatch(saveOptimizeSettings(payload));
++  }, [pendingChanges, tunables, dispatch]);
++
++  const handleRefreshStatusPress = useCallback(() => {
++    refetchStatus();
++  }, [refetchStatus]);
++
++  useEffect(() => {
++    dispatch(fetchOptimizeSettings());
++
++    return () => {
++      dispatch(clearPendingChanges({ section: `settings.${SECTION}` }));
++    };
++  }, [dispatch]);
++
++  useEffect(() => {
++    if (wasSaving && !isSaving && !saveError) {
++      refetchStatus();
++    }
++  }, [isSaving, wasSaving, saveError, refetchStatus]);
++
++  const renderField = (tunable: OptimizeSettingInfo) => {
++    const setting = (settings as Record<string, unknown>)[tunable.name] as
++      | Pending<OptimizeValue>
++      | undefined;
++
++    return (
++      <OptimizeField
++        key={tunable.name}
++        tunable={tunable}
++        setting={setting}
++        onInputChange={handleInputChange}
++      />
++    );
++  };
++
++  return (
++    <PageContent title="Optimize Settings">
++      <SettingsToolbar
++        hasPendingChanges={hasPendingChanges}
++        isSaving={isSaving}
++        onSavePress={handleSavePress}
++      />
++
++      <PageContentBody>
++        {isFetching && !isPopulated ? <LoadingIndicator /> : null}
++
++        {!isFetching && error ? (
++          <Alert kind={kinds.DANGER}>
++            Unable to load the Optimize settings.
++          </Alert>
++        ) : null}
++
++        {hasSettings && isPopulated && !error ? (
++          <Form
++            id="optimizeSettings"
++            validationErrors={validationErrors}
++            validationWarnings={validationWarnings}
++          >
++            <Alert kind={kinds.INFO}>
++              Settings of the optimizations built into this image. Changes apply
++              as soon as you save, without a restart. A value set by an
++              environment variable on the container is shown read-only.
++            </Alert>
++
++            <FieldSet legend="Optimize">
++              {mainTunables.map(renderField)}
++            </FieldSet>
++
++            <FieldSet legend="Advanced tuning">
++              <Alert kind={kinds.WARNING}>
++                These control internal caches and safety limits. The defaults
++                are tested; changing them can use more memory, hit download
++                hosts faster, or make imports slower. Use Reset to default if
++                unsure.
++              </Alert>
++
++              {advancedSections.map(([section, items]) => (
++                <div key={section}>
++                  <div className={styles.subheading}>{section}</div>
++                  {items.map(renderField)}
++                </div>
++              ))}
++            </FieldSet>
++
++            <FieldSet legend="All optimization settings">
++              <OptimizeSettingsList tunables={tunables} />
++            </FieldSet>
++
++            <FieldSet legend="Status">
++              <OptimizeStatusSection
++                status={status}
++                isFetching={isFetchingStatus}
++                hasError={hasStatusError}
++                onRefreshPress={handleRefreshStatusPress}
++              />
++            </FieldSet>
++          </Form>
++        ) : null}
++      </PageContentBody>
++    </PageContent>
++  );
++}
++
++export default OptimizeSettings;
+diff --git a/frontend/src/Settings/Optimize/OptimizeSettingsList.tsx b/frontend/src/Settings/Optimize/OptimizeSettingsList.tsx
+new file mode 100644
+index 000000000..eb121260f
+--- /dev/null
++++ b/frontend/src/Settings/Optimize/OptimizeSettingsList.tsx
+@@ -0,0 +1,138 @@
++import classNames from 'classnames';
++import React from 'react';
++import { OptimizeSettingInfo } from 'typings/Settings/OptimizeSettings';
++import formatOptimizeValue from './formatOptimizeValue';
++import styles from './OptimizeSettings.css';
++
++interface OptimizeSettingsListProps {
++  tunables: OptimizeSettingInfo[];
++}
++
++function groupBySection(tunables: OptimizeSettingInfo[]) {
++  const sections: [string, OptimizeSettingInfo[]][] = [];
++
++  tunables.forEach((tunable) => {
++    const existing = sections.find(([section]) => section === tunable.section);
++
++    if (existing) {
++      existing[1].push(tunable);
++    } else {
++      sections.push([tunable.section, [tunable]]);
++    }
++  });
++
++  return sections;
++}
++
++function getSource(tunable: OptimizeSettingInfo) {
++  if (!tunable.editable) {
++    return 'Fixed in this build';
++  }
++
++  if (tunable.locked) {
++    return `Environment variable ${tunable.environmentVariable} (locked)`;
++  }
++
++  return tunable.source === 'database' ? 'Saved on this page' : 'Default';
++}
++
++function OptimizeSettingsList({ tunables }: OptimizeSettingsListProps) {
++  return (
++    <div className={styles.list}>
++      <div className={styles.listIntro}>
++        Every value the optimizations in this build add or rely on, read from
++        the running app. Editable values can be changed above; the others say
++        how they can be changed.
++      </div>
++
++      {groupBySection(tunables).map(([section, items]) => {
++        return (
++          <div key={section} className={styles.listSection}>
++            <div className={styles.listSectionTitle}>{section}</div>
++
++            <div className={styles.listHeader}>
++              <div>Setting</div>
++              <div>Current</div>
++              <div>Default</div>
++              <div>Source and how to change it</div>
++            </div>
++
++            {items.map((tunable) => {
++              const isChanged =
++                tunable.editable && tunable.source !== 'default';
++
++              return (
++                <div key={tunable.name} className={styles.row}>
++                  <div>
++                    <div className={styles.rowName}>{tunable.label}</div>
++                    <div className={styles.rowDescription}>
++                      {tunable.description}
++                    </div>
++                  </div>
++
++                  <div
++                    className={classNames(
++                      styles.rowValue,
++                      isChanged && styles.changed,
++                      tunable.risky && styles.risky
++                    )}
++                  >
++                    <span className={styles.cellLabel}>Current:</span>
++                    {formatOptimizeValue(tunable, tunable.value)}
++                  </div>
++
++                  <div className={styles.rowValue}>
++                    <span className={styles.cellLabel}>Default:</span>
++                    {formatOptimizeValue(tunable, tunable.defaultValue)}
++                  </div>
++
++                  <div className={styles.rowMeta}>
++                    <div
++                      className={classNames(
++                        styles.rowSource,
++                        tunable.locked && styles.locked
++                      )}
++                    >
++                      {getSource(tunable)}
++                    </div>
++
++                    {tunable.note ? (
++                      <div className={styles.risky}>{tunable.note}</div>
++                    ) : null}
++
++                    {tunable.howToChange ? (
++                      <div>{tunable.howToChange}</div>
++                    ) : null}
++
++                    {tunable.environmentVariable && !tunable.locked ? (
++                      <div>
++                        Environment variable:{' '}
++                        <code className={styles.code}>
++                          {tunable.environmentVariable}
++                        </code>
++                      </div>
++                    ) : null}
++
++                    {tunable.constants.length ? (
++                      <div>
++                        Code:{' '}
++                        {tunable.constants.map((constant, index) => (
++                          <React.Fragment key={constant}>
++                            {index > 0 ? ', ' : null}
++                            <code className={styles.code}>{constant}</code>
++                          </React.Fragment>
++                        ))}
++                      </div>
++                    ) : null}
++                  </div>
++                </div>
++              );
++            })}
++          </div>
++        );
++      })}
++    </div>
++  );
++}
++
++export default OptimizeSettingsList;
+diff --git a/frontend/src/Settings/Optimize/OptimizeStatusSection.tsx b/frontend/src/Settings/Optimize/OptimizeStatusSection.tsx
+new file mode 100644
+index 000000000..78bb0ecce
+--- /dev/null
++++ b/frontend/src/Settings/Optimize/OptimizeStatusSection.tsx
+@@ -0,0 +1,94 @@
++import classNames from 'classnames';
++import React from 'react';
++import Alert from 'Components/Alert';
++import SpinnerButton from 'Components/Link/SpinnerButton';
++import LoadingIndicator from 'Components/Loading/LoadingIndicator';
++import { icons, kinds } from 'Helpers/Props';
++import { OptimizeStatus } from 'typings/Settings/OptimizeSettings';
++import { formatNumber } from './formatOptimizeValue';
++import styles from './OptimizeSettings.css';
++
++interface OptimizeStatusSectionProps {
++  status?: OptimizeStatus;
++  isFetching: boolean;
++  hasError: boolean;
++  onRefreshPress: () => void;
++}
++
++function OptimizeStatusSection({
++  status,
++  isFetching,
++  hasError,
++  onRefreshPress,
++}: OptimizeStatusSectionProps) {
++  return (
++    <div>
++      <div className={styles.statusHeader}>
++        <div className={styles.statusStarted}>
++          {status
++            ? `Counters since start-up (${new Date(
++                status.startedUtc
++              ).toLocaleString()}).`
++            : null}
++        </div>
++
++        <SpinnerButton
++          kind={kinds.DEFAULT}
++          spinnerIcon={icons.REFRESH}
++          isSpinning={isFetching}
++          onPress={onRefreshPress}
++        >
++          Refresh
++        </SpinnerButton>
++      </div>
++
++      {hasError ? (
++        <Alert kind={kinds.DANGER}>Unable to load the status.</Alert>
++      ) : null}
++
++      {!status && isFetching ? <LoadingIndicator /> : null}
++
++      {status ? (
++        <>
++          <div className={styles.counters}>
++            {status.counters.map((counter) => (
++              <div key={counter.name} className={styles.counter}>
++                <div className={styles.counterValue}>
++                  {formatNumber(counter.value)}
++                  {counter.unit ? (
++                    <span className={styles.counterUnit}> {counter.unit}</span>
++                  ) : null}
++                </div>
++                <div className={styles.counterLabel}>{counter.label}</div>
++              </div>
++            ))}
++          </div>
++
++          <div className={styles.listSectionTitle}>
++            Optimizations in this build
++          </div>
++
++          <ul className={styles.features}>
++            {status.features.map((feature) => (
++              <li key={feature.name} className={styles.feature}>
++                <span
++                  className={classNames(
++                    styles.dot,
++                    feature.active && styles.dotActive
++                  )}
++                />
++                <span className={styles.featureName}>{feature.name}</span>
++                <span className={styles.featureState}>{feature.state}</span>
++                <span className={styles.featureDescription}>
++                  {feature.description}
++                </span>
++              </li>
++            ))}
++          </ul>
++        </>
++      ) : null}
++    </div>
++  );
++}
++
++export default OptimizeStatusSection;
+diff --git a/frontend/src/Settings/Optimize/formatOptimizeValue.ts b/frontend/src/Settings/Optimize/formatOptimizeValue.ts
+new file mode 100644
+index 000000000..b4c4cc53d
+--- /dev/null
++++ b/frontend/src/Settings/Optimize/formatOptimizeValue.ts
+@@ -0,0 +1,69 @@
++import {
++  OptimizeSettingInfo,
++  OptimizeValue,
++} from 'typings/Settings/OptimizeSettings';
++
++export function formatNumber(value: number) {
++  return value.toLocaleString('en-US');
++}
++
++const singularUnits: Record<string, string> = {
++  minutes: 'minute',
++  seconds: 'second',
++  files: 'file',
++  entries: 'entry',
++  characters: 'character',
++};
++
++export function formatUnit(unit: string, value: number) {
++  return value === 1 && singularUnits[unit] ? singularUnits[unit] : unit;
++}
++
++function formatOptimizeValue(
++  tunable: Pick<OptimizeSettingInfo, 'kind' | 'unit' | 'name'>,
++  value: OptimizeValue | undefined
++) {
++  if (value == null) {
++    return '-';
++  }
++
++  if (typeof value === 'boolean') {
++    return value ? 'On' : 'Off';
++  }
++
++  if (typeof value === 'number') {
++    return tunable.unit
++      ? `${formatNumber(value)} ${formatUnit(tunable.unit, value)}`
++      : formatNumber(value);
++  }
++
++  if (value === '') {
++    return tunable.name === 'cacheHitHeader' ? 'Off (empty)' : '(empty)';
++  }
++
++  return value;
++}
++
++export function isRiskyValue(
++  tunable: OptimizeSettingInfo,
++  value: OptimizeValue | undefined
++) {
++  if (!tunable.warning || value == null) {
++    return false;
++  }
++
++  if (typeof value === 'boolean') {
++    return value !== tunable.defaultValue;
++  }
++
++  if (typeof value === 'number') {
++    return (
++      (tunable.warnBelow != null && value < tunable.warnBelow) ||
++      (tunable.warnAbove != null && value > tunable.warnAbove)
++    );
++  }
++
++  return false;
++}
++
++export default formatOptimizeValue;
+diff --git a/frontend/src/Settings/Settings.tsx b/frontend/src/Settings/Settings.tsx
+index 33f261186..5628c8d29 100644
+--- a/frontend/src/Settings/Settings.tsx
++++ b/frontend/src/Settings/Settings.tsx
+@@ -103,6 +103,15 @@ function Settings() {
+         </Link>
+ 
+         <div className={styles.summary}>{translate('UiSettingsSummary')}</div>
++
++        <Link className={styles.link} to="/settings/optimize">
++          Optimize
++        </Link>
++
++        <div className={styles.summary}>
++          Indexer request spacing, ffprobe timeout, cache sizes and the status
++          of the optimizations built into this image
++        </div>
+       </PageContentBody>
+     </PageContent>
+   );
+diff --git a/frontend/src/Store/Actions/Settings/optimize.js b/frontend/src/Store/Actions/Settings/optimize.js
+new file mode 100644
+index 000000000..622ee0282
+--- /dev/null
++++ b/frontend/src/Store/Actions/Settings/optimize.js
+@@ -0,0 +1,64 @@
++import { createAction } from 'redux-actions';
++import createFetchHandler from 'Store/Actions/Creators/createFetchHandler';
++import createSaveHandler from 'Store/Actions/Creators/createSaveHandler';
++import createSetSettingValueReducer from 'Store/Actions/Creators/Reducers/createSetSettingValueReducer';
++import { createThunk } from 'Store/thunks';
++
++//
++// Variables
++
++const section = 'settings.optimize';
++
++//
++// Actions Types
++
++export const FETCH_OPTIMIZE_SETTINGS = 'settings/optimize/fetchOptimizeSettings';
++export const SET_OPTIMIZE_SETTINGS_VALUE = 'settings/optimize/setOptimizeSettingsValue';
++export const SAVE_OPTIMIZE_SETTINGS = 'settings/optimize/saveOptimizeSettings';
++
++//
++// Action Creators
++
++export const fetchOptimizeSettings = createThunk(FETCH_OPTIMIZE_SETTINGS);
++export const saveOptimizeSettings = createThunk(SAVE_OPTIMIZE_SETTINGS);
++export const setOptimizeSettingsValue = createAction(SET_OPTIMIZE_SETTINGS_VALUE, (payload) => {
++  return {
++    section,
++    ...payload
++  };
++});
++
++//
++// Details
++
++export default {
++
++  //
++  // State
++
++  defaultState: {
++    isFetching: false,
++    isPopulated: false,
++    error: null,
++    pendingChanges: {},
++    isSaving: false,
++    saveError: null,
++    item: {}
++  },
++
++  //
++  // Action Handlers
++
++  actionHandlers: {
++    [FETCH_OPTIMIZE_SETTINGS]: createFetchHandler(section, '/config/optimize'),
++    [SAVE_OPTIMIZE_SETTINGS]: createSaveHandler(section, '/config/optimize')
++  },
++
++  //
++  // Reducers
++
++  reducers: {
++    [SET_OPTIMIZE_SETTINGS_VALUE]: createSetSettingValueReducer(section)
++  }
++
++};
+diff --git a/frontend/src/Store/Actions/settingsActions.js b/frontend/src/Store/Actions/settingsActions.js
+index f22abe809..495faea6d 100644
+--- a/frontend/src/Store/Actions/settingsActions.js
++++ b/frontend/src/Store/Actions/settingsActions.js
+@@ -22,6 +22,7 @@ import metadataOptions from './Settings/metadataOptions';
+ import naming from './Settings/naming';
+ import namingExamples from './Settings/namingExamples';
+ import notifications from './Settings/notifications';
++import optimize from './Settings/optimize';
+ import qualityDefinitions from './Settings/qualityDefinitions';
+ import qualityProfiles from './Settings/qualityProfiles';
+ import releaseProfiles from './Settings/releaseProfiles';
+@@ -49,6 +50,7 @@ export * from './Settings/metadataOptions';
+ export * from './Settings/naming';
+ export * from './Settings/namingExamples';
+ export * from './Settings/notifications';
++export * from './Settings/optimize';
+ export * from './Settings/qualityDefinitions';
+ export * from './Settings/qualityProfiles';
+ export * from './Settings/releaseProfiles';
+@@ -86,6 +88,7 @@ export const defaultState = {
+   naming: naming.defaultState,
+   namingExamples: namingExamples.defaultState,
+   notifications: notifications.defaultState,
++  optimize: optimize.defaultState,
+   qualityDefinitions: qualityDefinitions.defaultState,
+   qualityProfiles: qualityProfiles.defaultState,
+   releaseProfiles: releaseProfiles.defaultState,
+@@ -133,6 +136,7 @@ export const actionHandlers = handleThunks({
+   ...naming.actionHandlers,
+   ...namingExamples.actionHandlers,
+   ...notifications.actionHandlers,
++  ...optimize.actionHandlers,
+   ...qualityDefinitions.actionHandlers,
+   ...qualityProfiles.actionHandlers,
+   ...releaseProfiles.actionHandlers,
+@@ -170,6 +174,7 @@ export const reducers = createHandleActions({
+   ...naming.reducers,
+   ...namingExamples.reducers,
+   ...notifications.reducers,
++  ...optimize.reducers,
+   ...qualityDefinitions.reducers,
+   ...qualityProfiles.reducers,
+   ...releaseProfiles.reducers,
+diff --git a/frontend/src/Store/Selectors/selectSettings.ts b/frontend/src/Store/Selectors/selectSettings.ts
+index e9a47cdce..e7841d39e 100644
+--- a/frontend/src/Store/Selectors/selectSettings.ts
++++ b/frontend/src/Store/Selectors/selectSettings.ts
+@@ -25,6 +25,32 @@ function getValidationFailures(saveError?: Error): ValidationFailures {
+     };
+   }
+ 
++  // A body that is not a list of validation failures (an ASP.NET problem details object, for example a number too
++  // large for its field) is turned into field errors instead of breaking the page.
++  if (!Array.isArray(saveError.responseJSON)) {
++    const problem = saveError.responseJSON as
++      | { errors?: Record<string, string[]>; title?: string }
++      | undefined;
++
++    const errors = Object.keys(problem?.errors ?? {}).map((key) => {
++      const propertyName = key.replace(/^\$\.?/, '').split(/[.[]/)[0];
++
++      return {
++        propertyName,
++        errorMessage: propertyName
++          ? `Invalid value for ${propertyName}: not a number or text this field can hold`
++          : problem?.title ?? 'Invalid request',
++        isWarning: false,
++        severity: 'error',
++      } as ValidationError;
++    });
++
++    return {
++      errors,
++      warnings: [],
++    };
++  }
++
+   return cloneDeep(saveError.responseJSON as ValidationFailure[]).reduce(
+     (acc: ValidationFailures, failure: ValidationFailure) => {
+       if (failure.isWarning) {
+diff --git a/frontend/src/typings/Settings/OptimizeSettings.ts b/frontend/src/typings/Settings/OptimizeSettings.ts
+new file mode 100644
+index 000000000..d139dfcbc
+--- /dev/null
++++ b/frontend/src/typings/Settings/OptimizeSettings.ts
+@@ -0,0 +1,80 @@
++export type OptimizeValue = number | string | boolean | null;
++
++export type OptimizeValueSource =
++  | 'default'
++  | 'database'
++  | 'environment'
++  | 'fixed';
++
++export interface OptimizeSettingInfo {
++  name: string;
++  label: string;
++  section: string;
++  main: boolean;
++  editable: boolean;
++  kind: 'integer' | 'text' | 'boolean';
++  unit?: string;
++  min?: number;
++  max?: number;
++  value: OptimizeValue;
++  defaultValue: OptimizeValue;
++  savedValue?: OptimizeValue;
++  source: OptimizeValueSource;
++  sourceText: string;
++  locked: boolean;
++  environmentVariable?: string;
++  environmentValue?: string;
++  environmentError?: string;
++  description: string;
++  warning?: string;
++  warnBelow?: number;
++  warnAbove?: number;
++  risky: boolean;
++  zeroMeans?: string;
++  howToChange?: string;
++  note?: string;
++  constants: string[];
++}
++
++export interface OptimizeFeature {
++  name: string;
++  description: string;
++  active: boolean;
++  state: string;
++}
++
++export interface OptimizeCounter {
++  name: string;
++  label: string;
++  value: number;
++  unit?: string;
++}
++
++export interface OptimizeStatus {
++  startedUtc: string;
++  features: OptimizeFeature[];
++  counters: OptimizeCounter[];
++}
++
++export default interface OptimizeSettings {
++  id: number;
++  indexerRateLimitMs: number | null;
++  cacheHitHeader: string | null;
++  cacheHitValue: string | null;
++  ffprobeTimeoutMinutes: number | null;
++  grabSpacingMs: number | null;
++  customFormatCacheCapacity: number | null;
++  customFormatCacheExpiryMinutes: number | null;
++  customFormatCacheMaxInputChars: number | null;
++  decisionBatchMemo: boolean | null;
++  releaseProfileCache: boolean | null;
++  ffprobeCacheEntries: number | null;
++  ffprobeCacheMaxMegabytes: number | null;
++  ffprobeCacheMaxEntryKilobytes: number | null;
++  ffprobeCacheFailureMinutes: number | null;
++  ffprobeCacheIdleMinutes: number | null;
++  ffprobeCacheSettleSeconds: number | null;
++  ffprobeCacheUnsettledSeconds: number | null;
++  ffprobeCacheSweepSeconds: number | null;
++  tunables: OptimizeSettingInfo[];
++}
+diff --git a/src/NzbDrone.Core/Configuration/ConfigService.cs b/src/NzbDrone.Core/Configuration/ConfigService.cs
+index 361d997eb..e98aaf8a1 100644
+--- a/src/NzbDrone.Core/Configuration/ConfigService.cs
++++ b/src/NzbDrone.Core/Configuration/ConfigService.cs
+@@ -444,6 +444,59 @@ public bool CleanupMetadataImages
+ 
+         public string ApplicationUrl => GetValue("ApplicationUrl", string.Empty);
+ 
++        public int? OptimizeIndexerRateLimitMs
++        {
++            get { return GetOptimizeInt("OptimizeIndexerRateLimitMs"); }
++            set { SetOptimizeValue("OptimizeIndexerRateLimitMs", value?.ToString(CultureInfo.InvariantCulture)); }
++        }
++
++        public string OptimizeCacheHitHeader
++        {
++            get { return GetOptimizeValue("OptimizeCacheHitHeader"); }
++            set { SetOptimizeValue("OptimizeCacheHitHeader", value); }
++        }
++
++        public string OptimizeCacheHitValue
++        {
++            get { return GetOptimizeValue("OptimizeCacheHitValue"); }
++            set { SetOptimizeValue("OptimizeCacheHitValue", value); }
++        }
++
++        public int? OptimizeFfprobeTimeoutMinutes
++        {
++            get { return GetOptimizeInt("OptimizeFfprobeTimeoutMinutes"); }
++            set { SetOptimizeValue("OptimizeFfprobeTimeoutMinutes", value?.ToString(CultureInfo.InvariantCulture)); }
++        }
++
++        public string GetOptimizeValue(string configKey)
++        {
++            EnsureOptimizeKey(configKey);
++
++            var value = GetValue(configKey, string.Empty);
++
++            return string.IsNullOrWhiteSpace(value) ? null : value;
++        }
++
++        public void SetOptimizeValue(string configKey, string value)
++        {
++            EnsureOptimizeKey(configKey);
++
++            SetValue(configKey, value ?? string.Empty);
++        }
++
++        private int? GetOptimizeInt(string configKey)
++        {
++            return int.TryParse(GetOptimizeValue(configKey), NumberStyles.None, CultureInfo.InvariantCulture, out var value) ? value : null;
++        }
++
++        private static void EnsureOptimizeKey(string configKey)
++        {
++            if (configKey == null || !configKey.StartsWith("optimize", StringComparison.OrdinalIgnoreCase))
++            {
++                throw new ArgumentException("Optimize settings use keys that start with 'optimize'", nameof(configKey));
++            }
++        }
++
+         public bool TrustCgnatIpAddresses
+         {
+             get { return GetValueBoolean("TrustCgnatIpAddresses", false); }
+diff --git a/src/NzbDrone.Core/Configuration/IConfigService.cs b/src/NzbDrone.Core/Configuration/IConfigService.cs
+index f425f540e..c28d97c83 100644
+--- a/src/NzbDrone.Core/Configuration/IConfigService.cs
++++ b/src/NzbDrone.Core/Configuration/IConfigService.cs
+@@ -106,5 +106,14 @@ public interface IConfigService
+ 
+         CertificateValidationType CertificateValidation { get; }
+         string ApplicationUrl { get; }
++
++        // Optimize settings page. Saved values only (null = not saved); OptimizeSettings applies the environment
++        // variables and defaults. Keys start with "optimize".
++        int? OptimizeIndexerRateLimitMs { get; set; }
++        string OptimizeCacheHitHeader { get; set; }
++        string OptimizeCacheHitValue { get; set; }
++        int? OptimizeFfprobeTimeoutMinutes { get; set; }
++        string GetOptimizeValue(string configKey);
++        void SetOptimizeValue(string configKey, string value);
+     }
+ }
+diff --git a/src/NzbDrone.Core/CustomFormats/CustomFormatMatchCache.cs b/src/NzbDrone.Core/CustomFormats/CustomFormatMatchCache.cs
+index 72582a3b6..8b0dd8915 100644
+--- a/src/NzbDrone.Core/CustomFormats/CustomFormatMatchCache.cs
++++ b/src/NzbDrone.Core/CustomFormats/CustomFormatMatchCache.cs
+@@ -2,6 +2,8 @@
+ using System.Collections.Generic;
+ using System.Globalization;
+ using System.Linq;
++using System.Threading;
++using NzbDrone.Core.Optimize;
+ 
+ namespace NzbDrone.Core.CustomFormats
+ {
+@@ -11,9 +13,13 @@ namespace NzbDrone.Core.CustomFormats
+     //
+     // The key holds every input any supported specification reads, so an entry can
+     // never be stale for its key; definition edits replace the plan (and its entries)
+-    // immediately. Expiry therefore only bounds memory: entries idle for SlidingMs are
+-    // dropped, every hit refreshes the entry, and at Capacity the least recently used
+-    // entry is evicted.
++    // immediately. Expiry therefore only bounds memory: entries idle for the sliding expiry
++    // are dropped, every hit refreshes the entry, and at the capacity the least recently
++    // used entry is evicted.
++    //
++    // Capacity, sliding expiry and the input length limit are read from OptimizeSettings
++    // (Optimize settings page / environment); the constants below are their defaults. A
++    // capacity of 0 turns the cache off: every input takes the uncached path.
+     internal static class CustomFormatMatchCache
+     {
+         internal const int Capacity = 50_000;
+@@ -221,6 +227,13 @@ private static int[] Calculate(CustomFormatInput input, Plan plan)
+         internal static List<CustomFormat> Parse(CustomFormatInput input, List<CustomFormat> formats,
+             Func<CustomFormatInput, List<CustomFormat>, List<CustomFormat>> uncached)
+         {
++            var settings = OptimizeSettings.Current;
++
++            if (settings.CustomFormatCacheCapacity <= 0)
++            {
++                return uncached(input, formats);
++            }
++
+             Plan plan;
+             lock (Gate)
+             {
+@@ -241,14 +254,17 @@ internal static List<CustomFormat> Parse(CustomFormatInput input, List<CustomFor
+ 
+             // Bound retained text as well as entry count. Oversized inputs are evaluated normally.
+             var cacheable = (key.Title?.Length ?? 0) + (key.Filename?.Length ?? 0) +
+-                (key.Group?.Length ?? 0) + (key.Edition?.Length ?? 0) + (key.Languages?.Length ?? 0) <= MaxTextLength;
++                (key.Group?.Length ?? 0) + (key.Edition?.Length ?? 0) + (key.Languages?.Length ?? 0) <= settings.CustomFormatCacheMaxInputChars;
+ 
+             lock (Gate)
+             {
+                 if (cacheable && plan.Results.TryGetValue(key, out var node))
+                 {
+                     var now = Clock();
+-                    if (now - node.Value.LastUsed < SlidingMs)
++
++                    // Limits are read under the gate, so an entry is never served past a sliding expiry
++                    // that a settings change has just shortened.
++                    if (now - node.Value.LastUsed < OptimizeSettings.Current.CustomFormatCacheSlidingMs)
+                     {
+                         // Sliding expiry: a hit refreshes the entry and makes it most recent.
+                         node.Value.LastUsed = now;
+@@ -273,8 +289,14 @@ internal static List<CustomFormat> Parse(CustomFormatInput input, List<CustomFor
+             var indices = Calculate(input, plan);
+             lock (Gate)
+             {
++                // Read again under the gate: a settings change applies its limits under the same gate,
++                // so an insert after it never grows the cache past a smaller capacity.
++                var limits = OptimizeSettings.Current;
++                var capacity = limits.CustomFormatCacheCapacity;
++                var slidingMs = limits.CustomFormatCacheSlidingMs;
++
+                 // An in-flight old calculation cannot repopulate a newer definition generation.
+-                if (cacheable && ReferenceEquals(plan, _plan))
++                if (cacheable && capacity > 0 && ReferenceEquals(plan, _plan))
+                 {
+                     var now = Clock();
+                     if (plan.Results.TryGetValue(key, out var existing))
+@@ -288,14 +310,14 @@ internal static List<CustomFormat> Parse(CustomFormatInput input, List<CustomFor
+                     {
+                         // Least recently used entries sit at the tail: drop idle ones first,
+                         // then evict until there is room.
+-                        while (plan.Recency.Last != null && now - plan.Recency.Last.Value.LastUsed >= SlidingMs)
++                        while (plan.Recency.Last != null && now - plan.Recency.Last.Value.LastUsed >= slidingMs)
+                         {
+                             plan.Results.Remove(plan.Recency.Last.Value.Key);
+                             plan.Recency.RemoveLast();
+                             Expirations++;
+                         }
+ 
+-                        while (plan.Results.Count >= Capacity)
++                        while (plan.Results.Count >= capacity)
+                         {
+                             plan.Results.Remove(plan.Recency.Last.Value.Key);
+                             plan.Recency.RemoveLast();
+@@ -311,6 +333,67 @@ internal static List<CustomFormat> Parse(CustomFormatInput input, List<CustomFor
+             return Materialize(indices, formats);
+         }
+ 
++        internal static int Count
++        {
++            get
++            {
++                lock (Gate)
++                {
++                    return _plan?.Results.Count ?? 0;
++                }
++            }
++        }
++
++        // Applies changed limits at once (called after OptimizeSettings.Current changed). A capacity
++        // of 0 drops everything; a smaller capacity or expiry drops the least recently used or idle
++        // entries. Runs under the same gate as every lookup and insert.
++        internal static void ApplyLimits()
++        {
++            var settings = OptimizeSettings.Current;
++
++            lock (Gate)
++            {
++                var plan = _plan;
++
++                if (plan == null)
++                {
++                    return;
++                }
++
++                if (settings.CustomFormatCacheCapacity <= 0)
++                {
++                    // Free the entries now; a new plan is built (and checked against the definitions) when the
++                    // cache is turned on again. A lookup already past the capacity check then simply misses.
++                    plan.Results.Clear();
++                    plan.Recency.Clear();
++                    _plan = null;
++                    return;
++                }
++
++                var now = Clock();
++
++                while (plan.Recency.Last != null && now - plan.Recency.Last.Value.LastUsed >= settings.CustomFormatCacheSlidingMs)
++                {
++                    plan.Results.Remove(plan.Recency.Last.Value.Key);
++                    plan.Recency.RemoveLast();
++                    Expirations++;
++                }
++
++                while (plan.Results.Count > settings.CustomFormatCacheCapacity)
++                {
++                    plan.Results.Remove(plan.Recency.Last.Value.Key);
++                    plan.Recency.RemoveLast();
++                    Evictions++;
++                }
++            }
++        }
++
++        // Counters for the status page; they are only written under the gate.
++        internal static long ReadCounter(ref long counter)
++        {
++            return Interlocked.Read(ref counter);
++        }
++
+         private static List<CustomFormat> Materialize(int[] indices, List<CustomFormat> formats)
+         {
+             var result = new List<CustomFormat>(indices.Length);
+diff --git a/src/NzbDrone.Core/DecisionEngine/DecisionBatchCache.cs b/src/NzbDrone.Core/DecisionEngine/DecisionBatchCache.cs
+index 47817f678..2cef12576 100644
+--- a/src/NzbDrone.Core/DecisionEngine/DecisionBatchCache.cs
++++ b/src/NzbDrone.Core/DecisionEngine/DecisionBatchCache.cs
+@@ -3,6 +3,7 @@
+ using System.Threading;
+ using NzbDrone.Core.Indexers;
+ using NzbDrone.Core.Messaging.Events;
++using NzbDrone.Core.Optimize;
+ using NzbDrone.Core.ThingiProvider.Events;
+ 
+ namespace NzbDrone.Core.DecisionEngine
+@@ -45,7 +46,9 @@ internal static void Invalidate()
+         internal static IndexerDefinition Indexer(int id, Func<int, IndexerDefinition> load)
+         {
+             var scope = _current;
+-            if (scope == null)
++
++            // Memo off (Optimize settings): every lookup loads, as on stock.
++            if (scope == null || !OptimizeSettings.Current.DecisionBatchMemo)
+             {
+                 return load(id);
+             }
+diff --git a/src/NzbDrone.Core/Indexers/IndexerCacheHitRateLimiter.cs b/src/NzbDrone.Core/Indexers/IndexerCacheHitRateLimiter.cs
+index 128501f76..076d1a09f 100644
+--- a/src/NzbDrone.Core/Indexers/IndexerCacheHitRateLimiter.cs
++++ b/src/NzbDrone.Core/Indexers/IndexerCacheHitRateLimiter.cs
+@@ -9,6 +9,7 @@
+ using NzbDrone.Common.Extensions;
+ using NzbDrone.Common.Http;
+ using NzbDrone.Common.TPL;
++using NzbDrone.Core.Optimize;
+ 
+ namespace NzbDrone.Core.Indexers
+ {
+@@ -189,8 +190,13 @@ private async Task<HttpResponse> ExecuteWithRefundAsync(IHttpClient httpClient,
+             var interval = request.RateLimit;
+             var reservation = Reserve(request.Url.Host, request.RateLimitKey, interval);
+ 
++            Interlocked.Increment(ref OptimizeCounters.PacedRequests);
++
+             if (reservation.Delay.TotalSeconds > 0.0)
+             {
++                Interlocked.Increment(ref OptimizeCounters.PacedRequestsWaited);
++                OptimizeCounters.Add(ref OptimizeCounters.PacedWaitTicks, reservation.Delay);
++
+                 _logger.Trace("Rate Limit triggered, delaying '{0}' for {1:0.000} sec", request.Url.Host, reservation.Delay.TotalSeconds);
+                 await Task.Delay(reservation.Delay);
+             }
+@@ -216,12 +222,22 @@ private async Task<HttpResponse> ExecuteWithRefundAsync(IHttpClient httpClient,
+             // Only a response to the hop paced here refunds; redirected requests keep stock pacing throughout.
+             if (Volatile.Read(ref state.Hops) == 1 && IsCacheHit(response, options))
+             {
++                Interlocked.Increment(ref OptimizeCounters.CacheHitResponses);
++
++                // How far the slot moves back: from this request's reservation to the previous one (or now).
++                var refundedUntil = reservation.Previous.HasValue && reservation.Previous.Value > _utcNow() ? reservation.Previous.Value : _utcNow();
++                var refunded = reservation.Reserved - refundedUntil;
++
+                 if (Refund(reservation))
+                 {
++                    Interlocked.Increment(ref OptimizeCounters.Refunds);
++                    OptimizeCounters.Add(ref OptimizeCounters.RefundedTicks, refunded);
++
+                     _logger.Trace("Cache hit from '{0}', released its rate limit slot", request.Url.Host);
+                 }
+                 else
+                 {
++                    Interlocked.Increment(ref OptimizeCounters.RefundsKept);
+                     _logger.Trace("Cache hit from '{0}', rate limit slot kept: another request already reserved the next one", request.Url.Host);
+                 }
+             }
+diff --git a/src/NzbDrone.Core/Indexers/IndexerRateLimitOptions.cs b/src/NzbDrone.Core/Indexers/IndexerRateLimitOptions.cs
+index da0f4b69e..098f6ac20 100644
+--- a/src/NzbDrone.Core/Indexers/IndexerRateLimitOptions.cs
++++ b/src/NzbDrone.Core/Indexers/IndexerRateLimitOptions.cs
+@@ -5,13 +5,14 @@
+ using System.Threading;
+ using System.Threading.Tasks;
+ using NLog;
+-using NzbDrone.Common.Instrumentation;
+ using NzbDrone.Common.TPL;
++using NzbDrone.Core.Optimize;
+ 
+ namespace NzbDrone.Core.Indexers
+ {
+-    // Opt-in indexer rate-limit settings, read once from the environment on first use.
+-    // With none of the variables set every value equals stock: a 2 s base rate limit and no cache-hit handling.
++    // Opt-in indexer rate-limit settings. The values in effect come from OptimizeSettings.Current (environment variable,
++    // then the Optimize settings page, then the default) and follow every change without a restart.
++    // With nothing set every value equals stock: a 2 s base rate limit, 2 s grab spacing and no cache-hit handling.
+     public class IndexerRateLimitOptions
+     {
+         public const string RateLimitVariable = "ARR_INDEXER_RATE_LIMIT_MS";
+@@ -25,19 +26,22 @@ public class IndexerRateLimitOptions
+         public static readonly TimeSpan GrabRateLimit = TimeSpan.FromSeconds(2);
+         public static readonly IndexerRateLimitOptions Stock = new IndexerRateLimitOptions(StockRateLimit, null, DefaultCacheHitValue);
+ 
+-        private static readonly object CurrentLock = new object();
+-        private static IndexerRateLimitOptions _current;
+-
+         // Grab-to-grab spacing per download host when the base rate limit is lowered (see WaitForGrabAsync), kept per
+         // rate-limit service instance like RateLimitService's own store.
+         private static readonly ConditionalWeakTable<IRateLimitService, ConcurrentDictionary<string, GrabGate>> GrabGates =
+             new ConditionalWeakTable<IRateLimitService, ConcurrentDictionary<string, GrabGate>>();
+ 
+         public IndexerRateLimitOptions(TimeSpan baseRateLimit, string cacheHitHeader, string cacheHitValue)
++            : this(baseRateLimit, cacheHitHeader, cacheHitValue, GrabRateLimit)
++        {
++        }
++
++        public IndexerRateLimitOptions(TimeSpan baseRateLimit, string cacheHitHeader, string cacheHitValue, TimeSpan grabSpacing)
+         {
+             BaseRateLimit = baseRateLimit;
+             CacheHitHeader = string.IsNullOrWhiteSpace(cacheHitHeader) ? null : cacheHitHeader.Trim();
+             CacheHitValue = string.IsNullOrWhiteSpace(cacheHitValue) ? DefaultCacheHitValue : cacheHitValue.Trim();
++            GrabSpacing = grabSpacing < TimeSpan.Zero ? TimeSpan.Zero : grabSpacing;
+         }
+ 
+         // Rate limit for indexer types that do not override HttpIndexerBase.RateLimit.
+@@ -49,58 +53,49 @@ public IndexerRateLimitOptions(TimeSpan baseRateLimit, string cacheHitHeader, st
+         // Header value that means "cache hit" (compared case-insensitively).
+         public string CacheHitValue { get; }
+ 
++        // Minimum time between two grabs from one download host (stock: 2 s).
++        public TimeSpan GrabSpacing { get; }
++
+         public bool RefundsCacheHits => CacheHitHeader != null;
+ 
+-        public bool IsStock => BaseRateLimit == StockRateLimit && !RefundsCacheHits;
++        public bool IsStock => BaseRateLimit == StockRateLimit && !RefundsCacheHits && GrabSpacing == GrabRateLimit;
+ 
+-        // The options in effect. Setting null makes the next read parse the environment again (used by tests).
++        // The options in effect: one volatile read of the current optimization settings, so a change on the Optimize page
++        // applies to the next request. Setting null makes the next read parse the environment again (used by tests).
+         public static IndexerRateLimitOptions Current
+         {
+-            get
+-            {
+-                var current = Volatile.Read(ref _current);
+-
+-                if (current != null)
+-                {
+-                    return current;
+-                }
+-
+-                lock (CurrentLock)
+-                {
+-                    if (_current == null)
+-                    {
+-                        Volatile.Write(ref _current, FromEnvironment(Environment.GetEnvironmentVariable, NzbDroneLogger.GetLogger(typeof(IndexerRateLimitOptions))));
+-                    }
+-
+-                    return _current;
+-                }
+-            }
++            get => OptimizeSettings.Current.RateLimit;
+ 
+             internal set
+             {
+-                lock (CurrentLock)
++                if (value == null)
++                {
++                    OptimizeSettings.ResetEnvironment();
++                }
++                else
+                 {
+-                    Volatile.Write(ref _current, value);
++                    OptimizeSettings.Current = OptimizeSettings.Current.WithRateLimit(value);
+                 }
+             }
+         }
+ 
+         // Paces a grab from a download host; called by DownloadService before each grab. Stock (and whenever the base
+-        // rate limit is not lowered) this is exactly the stock call: one 2 s pulse of "<host>". That pulse also sets the
++        // rate limit is not below the grab spacing G, stock 2 s) this is exactly the stock call: one G pulse of "<host>"
++        // (G = 2 s: the stock call itself). That pulse also sets the
+         // earliest start of the next indexer request to the same host (RateLimitService takes max(now + I, "<host>")),
+         // which is harmless at the stock I = 2 s but would hold the next search up to 2 s - I longer than stock with a
+-        // lowered I. So with a lowered base, grabs keep their stock 2 s spacing against each other, counted from the time
++        // lowered I. So with a lowered base, grabs keep their G spacing against each other, counted from the time
+         // each grab was released, and "<host>" is pulsed with the base interval: the grab still waits for the previous
+         // request to that host, exactly as it waits for it on stock, but the next search is no longer held for the rest
+         // of the 2 s.
+         internal static Task WaitForGrabAsync(IRateLimitService rateLimitService, string host, IndexerRateLimitOptions options)
+         {
+-            if (options.BaseRateLimit >= GrabRateLimit)
++            if (options.BaseRateLimit >= options.GrabSpacing)
+             {
+-                return rateLimitService.WaitAndPulseAsync(host, GrabRateLimit);
++                return rateLimitService.WaitAndPulseAsync(host, options.GrabSpacing);
+             }
+ 
+-            return WaitForGrabWithLoweredBaseAsync(rateLimitService, host, options.BaseRateLimit);
++            return WaitForGrabWithLoweredBaseAsync(rateLimitService, host, options.BaseRateLimit, options.GrabSpacing);
+         }
+ 
+         public static IndexerRateLimitOptions FromEnvironment(Func<string, string> getVariable, Logger logger)
+@@ -173,7 +168,7 @@ public static IndexerRateLimitOptions FromEnvironment(Func<string, string> getVa
+             return options;
+         }
+ 
+-        private static async Task WaitForGrabWithLoweredBaseAsync(IRateLimitService rateLimitService, string host, TimeSpan baseRateLimit)
++        private static async Task WaitForGrabWithLoweredBaseAsync(IRateLimitService rateLimitService, string host, TimeSpan baseRateLimit, TimeSpan grabSpacing)
+         {
+             var gate = GrabGates.GetValue(rateLimitService, _ => new ConcurrentDictionary<string, GrabGate>())
+                 .GetOrAdd(host, _ => new GrabGate());
+@@ -183,8 +178,8 @@ private static async Task WaitForGrabWithLoweredBaseAsync(IRateLimitService rate
+ 
+             try
+             {
+-                // At least 2 s after the previous grab from this host was released, as stock spaces grabs.
+-                var delay = gate.LastRelease + GrabRateLimit - DateTime.UtcNow;
++                // At least G after the previous grab from this host was released, as stock spaces grabs (G = 2 s).
++                var delay = gate.LastRelease + grabSpacing - DateTime.UtcNow;
+ 
+                 if (delay > TimeSpan.Zero)
+                 {
+diff --git a/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs b/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs
+index f8217a531..822615feb 100644
+--- a/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs
++++ b/src/NzbDrone.Core/MediaFiles/MediaInfo/MediaInfoProbeCache.cs
+@@ -4,6 +4,7 @@
+ using System.Linq;
+ using System.Reflection;
+ using System.Threading;
++using NzbDrone.Core.Optimize;
+ 
+ namespace NzbDrone.Core.MediaFiles.MediaInfo
+ {
+@@ -13,6 +14,9 @@ namespace NzbDrone.Core.MediaFiles.MediaInfo
+     // file stamp (size, last write time and, for a symlink, the last write time of its final target) are
+     // exactly those seen before and after the probe. Callers get their own copy of the model, never the
+     // cached instance.
++    //
++    // The limits below are the defaults; the limits in effect come from OptimizeSettings.Current.FfprobeCache
++    // (Optimize settings page / environment) and apply to the next lookup or store. ApplyLimits trims at once.
+     internal sealed class MediaInfoProbeCache
+     {
+         internal const int Capacity = 1000;
+@@ -120,18 +124,19 @@ internal bool TryGet(string path, FileStamp stamp, out MediaInfoModel model)
+         {
+             model = null;
+             var now = Clock();
++            var limits = OptimizeSettings.Current.FfprobeCache;
+ 
+             if (_entries.TryGetValue(path, out var entry))
+             {
+                 if (entry.Stamp.Equals(stamp) &&
+                     now < entry.ExpiresAt &&
+-                    now - Volatile.Read(ref entry.LastAccess) < IdleLifetimeMs)
++                    now - Volatile.Read(ref entry.LastAccess) < limits.IdleLifetimeMs)
+                 {
+                     Volatile.Write(ref entry.LastAccess, now);
+                     Interlocked.Increment(ref Hits);
+                     model = Copy(entry.Model);
+ 
+-                    SweepIfDue(now);
++                    SweepIfDue(now, limits);
+ 
+                     return true;
+                 }
+@@ -144,7 +149,7 @@ internal bool TryGet(string path, FileStamp stamp, out MediaInfoModel model)
+ 
+             Interlocked.Increment(ref Misses);
+ 
+-            SweepIfDue(now);
++            SweepIfDue(now, limits);
+ 
+             return false;
+         }
+@@ -158,22 +163,19 @@ internal void Add(string path, long length, DateTime lastWrite, MediaInfoModel m
+         internal void Add(string path, FileStamp stamp, MediaInfoModel model, DateTime probeStartedUtc)
+         {
+             var now = Clock();
+-            var settled = probeStartedUtc - stamp.NewestWrite >= SettleTime;
++            var limits = OptimizeSettings.Current.FfprobeCache;
++            var settled = probeStartedUtc - stamp.NewestWrite >= limits.SettleTime;
+ 
+             long expiresAt;
+ 
+             if (model == null)
+             {
+-                if (!settled)
+-                {
+-                    return;
+-                }
+-
+-                expiresAt = now + FailureLifetimeMs;
++                // A failure of a recently written file is not remembered at all.
++                expiresAt = settled ? now + limits.FailureLifetimeMs : now;
+             }
+             else
+             {
+-                expiresAt = settled ? long.MaxValue : now + UnsettledLifetimeMs;
++                expiresAt = settled ? long.MaxValue : now + limits.UnsettledLifetimeMs;
+             }
+ 
+             var size = EstimateSize(model);
+@@ -185,7 +187,10 @@ internal void Add(string path, FileStamp stamp, MediaInfoModel model, DateTime p
+                     Remove(path, old);
+                 }
+ 
+-                if (size > MaxEntryBytes)
++                // Off (no room at all), too large, or nothing to reuse (failure lifetime or recently-written
++                // lifetime 0): not stored, and an older result for this path is gone too, so a lookup never returns
++                // anything but the latest probe.
++                if (!limits.Enabled || size > limits.MaxEntryBytes || expiresAt <= now)
+                 {
+                     return;
+                 }
+@@ -203,10 +208,30 @@ internal void Add(string path, FileStamp stamp, MediaInfoModel model, DateTime p
+ 
+                 Interlocked.Increment(ref Stores);
+ 
+-                if (_entries.Count > Capacity || _bytes > MaxBytes || now - _lastSweep >= SweepIntervalMs)
++                if (_entries.Count > limits.Capacity || _bytes > limits.MaxBytes || now - _lastSweep >= limits.SweepIntervalMs)
++                {
++                    Trim(now, limits);
++                }
++            }
++        }
++
++        // Applies changed limits at once: everything is dropped when the cache is turned off, otherwise expired entries
++        // and the least recently used ones over a smaller bound. Under the writer lock, like every other change.
++        internal void ApplyLimits()
++        {
++            var limits = OptimizeSettings.Current.FfprobeCache;
++
++            lock (_writer)
++            {
++                if (!limits.Enabled)
+                 {
+-                    Trim(now);
++                    _entries.Clear();
++                    _bytes = 0;
++
++                    return;
+                 }
++
++                Trim(Clock(), limits);
+             }
+         }
+ 
+@@ -233,16 +258,16 @@ internal static long EstimateSize(MediaInfoModel model)
+             return 1024 + (2L * chars) + (256L * streams);
+         }
+ 
+-        private void SweepIfDue(long now)
++        private void SweepIfDue(long now, MediaInfoProbeCacheLimits limits)
+         {
+-            if (now - Volatile.Read(ref _lastSweep) < SweepIntervalMs || !Monitor.TryEnter(_writer))
++            if (now - Volatile.Read(ref _lastSweep) < limits.SweepIntervalMs || !Monitor.TryEnter(_writer))
+             {
+                 return;
+             }
+ 
+             try
+             {
+-                Trim(now);
++                Trim(now, limits);
+             }
+             finally
+             {
+@@ -260,19 +285,20 @@ private void Remove(string path, Entry entry)
+         }
+ 
+         // Caller holds _writer.
+-        private void Trim(long now)
++        private void Trim(long now, MediaInfoProbeCacheLimits limits)
+         {
+             Volatile.Write(ref _lastSweep, now);
+ 
+             foreach (var pair in _entries)
+             {
+-                if (now >= pair.Value.ExpiresAt || now - Volatile.Read(ref pair.Value.LastAccess) >= IdleLifetimeMs)
++                if (now >= pair.Value.ExpiresAt || now - Volatile.Read(ref pair.Value.LastAccess) >= limits.IdleLifetimeMs ||
++                    pair.Value.Size > limits.MaxEntryBytes)
+                 {
+                     Remove(pair.Key, pair.Value);
+                 }
+             }
+ 
+-            if (_entries.Count <= Capacity && _bytes <= MaxBytes)
++            if (_entries.Count <= limits.Capacity && _bytes <= limits.MaxBytes)
+             {
+                 return;
+             }
+@@ -284,7 +310,7 @@ private void Trim(long now)
+ 
+             foreach (var pair in victims)
+             {
+-                if (_entries.Count <= Capacity - EvictionBatch && _bytes <= MaxBytes - (MaxBytes / 10))
++                if (_entries.Count <= limits.Capacity - (limits.Capacity / 10) && _bytes <= limits.MaxBytes - (limits.MaxBytes / 10))
+                 {
+                     break;
+                 }
+diff --git a/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs b/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs
+index 529667ad1..ec791d9b0 100644
+--- a/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs
++++ b/src/NzbDrone.Core/MediaFiles/MediaInfo/VideoFileInfoReader.cs
+@@ -8,6 +8,7 @@
+ using NLog;
+ using NzbDrone.Common.Disk;
+ using NzbDrone.Common.Extensions;
++using NzbDrone.Core.Optimize;
+ 
+ namespace NzbDrone.Core.MediaFiles.MediaInfo
+ {
+@@ -31,7 +32,15 @@ public class VideoFileInfoReader : IVideoFileInfoReader
+         private static readonly string[] ValidHdrTransferFunctions = HlgTransferFunctions.Concat(PqTransferFunctions).ToArray();
+ 
+         // One budget for all ffprobe runs of a single probe, so a hung ffprobe cannot block the command thread forever.
+-        internal static TimeSpan ProbeTimeout { get; set; } = TimeSpan.FromMinutes(5);
++        // The ffprobe timeout of the Optimize settings (default 15 minutes; zero = no timeout, the stock calls). Setting it
++        // (tests) replaces the value in the current optimization settings.
++        internal static TimeSpan ProbeTimeout
++        {
++            get => OptimizeSettings.Current.FfprobeTimeout;
++            set => OptimizeSettings.Current = OptimizeSettings.Current.WithFfprobeTimeout(value);
++        }
++
++        internal static readonly TimeSpan DefaultProbeTimeout = TimeSpan.FromMinutes(OptimizeTunables.DefaultFfprobeTimeoutMinutes);
+ 
+         private readonly MediaInfoProbeCache _probeCache = new MediaInfoProbeCache();
+ 
+@@ -58,7 +67,8 @@ public MediaInfoModel GetMediaInfo(string filename)
+                 return null;
+             }
+ 
+-            if (!TryGetFileStamp(filename, out var stamp))
++            // Cache off: every read runs ffprobe, as on stock.
++            if (!OptimizeSettings.Current.FfprobeCache.Enabled || !TryGetFileStamp(filename, out var stamp))
+             {
+                 return ProbeMediaInfo(filename);
+             }
+@@ -126,20 +136,46 @@ private bool TryGetFileStamp(string filename, out MediaInfoProbeCache.FileStamp
+             }
+         }
+ 
++        // The cache of this reader, for the Optimize status page and for applying changed limits.
++        internal MediaInfoProbeCache ProbeCache => _probeCache;
++
++        internal void ApplyCacheLimits()
++        {
++            _probeCache.ApplyLimits();
++        }
++
++        // With a timeout the cancellable calls; without one (0) exactly the stock calls.
++        private static IMediaAnalysis Analyse(string filename, string arguments, CancellationToken cancellationToken)
++        {
++            return cancellationToken.CanBeCanceled
++                ? FFProbe.AnalyseAsync(filename, customArguments: arguments, cancellationToken: cancellationToken).GetAwaiter().GetResult()
++                : FFProbe.Analyse(filename, customArguments: arguments);
++        }
++
++        private static FFProbeFrames GetFrames(string filename, string arguments, CancellationToken cancellationToken)
++        {
++            return cancellationToken.CanBeCanceled
++                ? FFProbe.GetFramesAsync(filename, customArguments: arguments, cancellationToken: cancellationToken).GetAwaiter().GetResult()
++                : FFProbe.GetFrames(filename, customArguments: arguments);
++        }
++
+         private MediaInfoModel ProbeMediaInfo(string filename)
+         {
++            var timeout = ProbeTimeout;
++
+             try
+             {
+                 _logger.Debug("Getting media info from {0}", filename);
+ 
+-                using var cts = new CancellationTokenSource(ProbeTimeout);
++                using var cts = timeout > TimeSpan.Zero ? new CancellationTokenSource(timeout) : null;
++                var cancellationToken = cts?.Token ?? CancellationToken.None;
+ 
+-                var analysis = FFProbe.AnalyseAsync(filename, customArguments: "-probesize 50000000", cancellationToken: cts.Token).GetAwaiter().GetResult();
++                var analysis = Analyse(filename, "-probesize 50000000", cancellationToken);
+                 var primaryVideoStream = GetPrimaryVideoStream(analysis);
+ 
+                 if (analysis.PrimaryAudioStream?.ChannelLayout.IsNullOrWhiteSpace() ?? true)
+                 {
+-                    analysis = FFProbe.AnalyseAsync(filename, customArguments: "-probesize 150000000 -analyzeduration 150000000", cancellationToken: cts.Token).GetAwaiter().GetResult();
++                    analysis = Analyse(filename, "-probesize 150000000 -analyzeduration 150000000", cancellationToken);
+                 }
+ 
+                 var mediaInfoModel = new MediaInfoModel();
+@@ -238,7 +274,7 @@ private MediaInfoModel ProbeMediaInfo(string filename)
+                 if (PqTransferFunctions.Contains(mediaInfoModel.VideoTransferCharacteristics))
+                 {
+                     var videoStreamIndex = analysis.VideoStreams.ToList().FindIndex(stream => stream.Index == primaryVideoStream?.Index);
+-                    frames = FFProbe.GetFramesAsync(filename, customArguments: $"-read_intervals \"%+#1\" -select_streams v:{(videoStreamIndex == -1 ? 0 : videoStreamIndex)}", cancellationToken: cts.Token).GetAwaiter().GetResult();
++                    frames = GetFrames(filename, $"-read_intervals \"%+#1\" -select_streams v:{(videoStreamIndex == -1 ? 0 : videoStreamIndex)}", cancellationToken);
+                 }
+ 
+                 var streamSideData = primaryVideoStream?.SideData ?? new List<IReadOnlyDictionary<string, JsonNode>>().AsReadOnly();
+@@ -249,9 +285,10 @@ private MediaInfoModel ProbeMediaInfo(string filename)
+ 
+                 return mediaInfoModel;
+             }
+-            catch (OperationCanceledException)
++            catch (OperationCanceledException) when (timeout > TimeSpan.Zero)
+             {
+-                _logger.Error("ffprobe did not finish within {0} and was stopped, unable to parse media info from file: {1}", ProbeTimeout, filename);
++                Interlocked.Increment(ref OptimizeCounters.FfprobeTimeouts);
++                _logger.Error("ffprobe did not finish within {0} (ffprobe timeout on the Optimize settings page) and was stopped, unable to parse media info from file: {1}", timeout, filename);
+             }
+             catch (Exception ex)
+             {
+diff --git a/src/NzbDrone.Core/Optimize/OptimizeCounters.cs b/src/NzbDrone.Core/Optimize/OptimizeCounters.cs
+new file mode 100644
+index 000000000..dbb1ab8ca
+--- /dev/null
++++ b/src/NzbDrone.Core/Optimize/OptimizeCounters.cs
+@@ -0,0 +1,44 @@
++using System;
++using System.Threading;
++
++namespace NzbDrone.Core.Optimize
++{
++    // Counters since start-up for the Optimize status page. Updated with Interlocked only; no locks on hot paths.
++    public static class OptimizeCounters
++    {
++        public static readonly DateTime StartedUtc = DateTime.UtcNow;
++
++        // Indexer responses that carried the cache hit header with the cache hit value.
++        internal static long CacheHitResponses;
++
++        // Cache hits whose rate-limit slot was given back, and those whose slot was kept because a later request had
++        // already reserved the next one.
++        internal static long Refunds;
++        internal static long RefundsKept;
++
++        // Rate-limit time handed back by refunds, in ticks.
++        internal static long RefundedTicks;
++
++        // Indexer requests paced by the cache-hit limiter (only while the cache hit header is set; otherwise requests are
++        // paced inside HttpClient exactly as on stock and are not counted here), how many of them waited, and for how long.
++        internal static long PacedRequests;
++        internal static long PacedRequestsWaited;
++        internal static long PacedWaitTicks;
++
++        // ffprobe runs stopped by the ffprobe timeout.
++        internal static long FfprobeTimeouts;
++
++        internal static void Add(ref long counter, TimeSpan time)
++        {
++            if (time > TimeSpan.Zero)
++            {
++                Interlocked.Add(ref counter, time.Ticks);
++            }
++        }
++
++        internal static long Read(ref long counter)
++        {
++            return Interlocked.Read(ref counter);
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/Optimize/OptimizeSettings.cs b/src/NzbDrone.Core/Optimize/OptimizeSettings.cs
+new file mode 100644
+index 000000000..2987f7ae8
+--- /dev/null
++++ b/src/NzbDrone.Core/Optimize/OptimizeSettings.cs
+@@ -0,0 +1,368 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Threading;
++using NLog;
++using NzbDrone.Common.Instrumentation;
++using NzbDrone.Core.Indexers;
++
++namespace NzbDrone.Core.Optimize
++{
++    public class OptimizeEffectiveValue
++    {
++        public object Value { get; init; }
++        public OptimizeValueSource Source { get; init; }
++
++        // The value saved on the page (null when none), also when an environment variable overrides it.
++        public object SavedValue { get; init; }
++
++        // The raw environment variable, when it is set (valid or not).
++        public string EnvironmentText { get; init; }
++
++        // Why the environment variable is ignored, when it is set but invalid.
++        public string EnvironmentError { get; init; }
++    }
++
++    // Limits of the ffprobe result cache (MediaInfoProbeCache), in the units the cache works with.
++    public sealed class MediaInfoProbeCacheLimits
++    {
++        public int Capacity { get; init; }
++        public long MaxBytes { get; init; }
++        public long MaxEntryBytes { get; init; }
++        public long FailureLifetimeMs { get; init; }
++        public long IdleLifetimeMs { get; init; }
++        public TimeSpan SettleTime { get; init; }
++        public long UnsettledLifetimeMs { get; init; }
++        public long SweepIntervalMs { get; init; }
++
++        public bool Enabled => Capacity > 0 && MaxBytes > 0;
++    }
++
++    // An immutable snapshot of every optimization setting in effect. Hot paths read OptimizeSettings.Current (one
++    // volatile read) and then only fields of the snapshot; a change builds a new snapshot and swaps it in, so a reader
++    // never sees a half-applied change. Precedence per value: a valid environment variable, then the value saved on
++    // the Optimize page (Config table), then the built-in default (the stock behaviour or the tested default).
++    public sealed class OptimizeSettings
++    {
++        private static readonly object CurrentLock = new object();
++        private static OptimizeSettings _current;
++        private static OptimizeEnvironment _environment;
++        private static Func<string, string> _lastSaved;
++
++        private readonly Dictionary<string, OptimizeEffectiveValue> _values;
++
++        private OptimizeSettings(Dictionary<string, OptimizeEffectiveValue> values, IndexerRateLimitOptions rateLimit, TimeSpan? ffprobeTimeout, int checkForFinishedDownloadInterval)
++        {
++            _values = values;
++
++            RateLimit = rateLimit ?? new IndexerRateLimitOptions(
++                TimeSpan.FromMilliseconds(Long(OptimizeTunables.IndexerRateLimitMs)),
++                Text(OptimizeTunables.CacheHitHeader),
++                Text(OptimizeTunables.CacheHitValue),
++                TimeSpan.FromMilliseconds(Long(OptimizeTunables.GrabSpacingMs)));
++
++            FfprobeTimeout = ffprobeTimeout ?? TimeSpan.FromMinutes(Long(OptimizeTunables.FfprobeTimeoutMinutes));
++
++            CustomFormatCacheCapacity = (int)Long(OptimizeTunables.CustomFormatCacheCapacity);
++            CustomFormatCacheSlidingMs = Long(OptimizeTunables.CustomFormatCacheExpiryMinutes) * 60_000;
++            CustomFormatCacheMaxInputChars = (int)Long(OptimizeTunables.CustomFormatCacheMaxInputChars);
++            DecisionBatchMemo = Bool(OptimizeTunables.DecisionBatchMemo);
++            ReleaseProfileCache = Bool(OptimizeTunables.ReleaseProfileCache);
++            CheckForFinishedDownloadInterval = checkForFinishedDownloadInterval;
++
++            var maxBytes = Long(OptimizeTunables.FfprobeCacheMaxMegabytes) * 1024 * 1024;
++
++            FfprobeCache = new MediaInfoProbeCacheLimits
++            {
++                Capacity = (int)Long(OptimizeTunables.FfprobeCacheEntries),
++                MaxBytes = maxBytes,
++                MaxEntryBytes = Math.Min(Long(OptimizeTunables.FfprobeCacheMaxEntryKilobytes) * 1024, maxBytes),
++                FailureLifetimeMs = Long(OptimizeTunables.FfprobeCacheFailureMinutes) * 60_000,
++                IdleLifetimeMs = Long(OptimizeTunables.FfprobeCacheIdleMinutes) * 60_000,
++                SettleTime = TimeSpan.FromSeconds(Long(OptimizeTunables.FfprobeCacheSettleSeconds)),
++                UnsettledLifetimeMs = Long(OptimizeTunables.FfprobeCacheUnsettledSeconds) * 1000,
++                SweepIntervalMs = Long(OptimizeTunables.FfprobeCacheSweepSeconds) * 1000
++            };
++        }
++
++        // The settings in effect. Before the app has read its database this is the environment plus the defaults.
++        public static OptimizeSettings Current
++        {
++            get
++            {
++                var current = Volatile.Read(ref _current);
++
++                if (current != null)
++                {
++                    return current;
++                }
++
++                lock (CurrentLock)
++                {
++                    if (_current == null)
++                    {
++                        Volatile.Write(ref _current, Build(Environment, _lastSaved, 1));
++                    }
++
++                    return _current;
++                }
++            }
++
++            internal set
++            {
++                lock (CurrentLock)
++                {
++                    Volatile.Write(ref _current, value);
++                }
++            }
++        }
++
++        // The environment variables, read once (they cannot change while the process runs).
++        internal static OptimizeEnvironment Environment
++        {
++            get
++            {
++                var environment = Volatile.Read(ref _environment);
++
++                if (environment != null)
++                {
++                    return environment;
++                }
++
++                lock (CurrentLock)
++                {
++                    _environment ??= OptimizeEnvironment.Read(System.Environment.GetEnvironmentVariable, NzbDroneLogger.GetLogger(typeof(OptimizeSettings)));
++
++                    return _environment;
++                }
++            }
++        }
++
++        public IndexerRateLimitOptions RateLimit { get; }
++        public TimeSpan FfprobeTimeout { get; }
++        public int CustomFormatCacheCapacity { get; }
++        public long CustomFormatCacheSlidingMs { get; }
++        public int CustomFormatCacheMaxInputChars { get; }
++        public bool DecisionBatchMemo { get; }
++        public bool ReleaseProfileCache { get; }
++        public MediaInfoProbeCacheLimits FfprobeCache { get; }
++        public int CheckForFinishedDownloadInterval { get; }
++
++        public IReadOnlyDictionary<string, OptimizeEffectiveValue> Values => _values;
++
++        public OptimizeEffectiveValue this[string name] => _values[name];
++
++        public bool IsLocked(string name)
++        {
++            return _values.TryGetValue(name, out var value) && value.Source == OptimizeValueSource.Environment;
++        }
++
++        // Builds and publishes the snapshot for the given saved values (a lookup by config key; null = nothing saved).
++        public static OptimizeSettings Load(Func<string, string> saved, int checkForFinishedDownloadInterval)
++        {
++            lock (CurrentLock)
++            {
++                _lastSaved = saved;
++                var settings = Build(Environment, saved, checkForFinishedDownloadInterval);
++                Volatile.Write(ref _current, settings);
++
++                return settings;
++            }
++        }
++
++        // Test hook: read the environment again and rebuild from the last saved values.
++        internal static void ResetEnvironment()
++        {
++            lock (CurrentLock)
++            {
++                _environment = null;
++                _current = null;
++            }
++        }
++
++        // Test hook: forget saved values and environment; the next read is the defaults plus the environment.
++        internal static void Reset()
++        {
++            lock (CurrentLock)
++            {
++                _environment = null;
++                _lastSaved = null;
++                _current = null;
++            }
++        }
++
++        public static OptimizeSettings Build(OptimizeEnvironment environment, Func<string, string> saved, int checkForFinishedDownloadInterval)
++        {
++            var values = new Dictionary<string, OptimizeEffectiveValue>(StringComparer.OrdinalIgnoreCase);
++
++            foreach (var tunable in OptimizeTunables.Editable)
++            {
++                object savedValue = null;
++                var savedText = saved?.Invoke(tunable.ConfigKey);
++
++                if (!string.IsNullOrWhiteSpace(savedText) && tunable.TryParse(savedText, false, out var parsed) == null)
++                {
++                    savedValue = parsed;
++                }
++
++                environment.Texts.TryGetValue(tunable.Name, out var environmentText);
++                environment.Errors.TryGetValue(tunable.Name, out var environmentError);
++
++                OptimizeValueSource source;
++                object value;
++
++                if (environment.Values.TryGetValue(tunable.Name, out var environmentValue))
++                {
++                    source = OptimizeValueSource.Environment;
++                    value = environmentValue;
++                }
++                else if (savedValue != null)
++                {
++                    source = OptimizeValueSource.Database;
++                    value = savedValue;
++                }
++                else
++                {
++                    source = OptimizeValueSource.Default;
++                    value = tunable.DefaultValue;
++                }
++
++                values[tunable.Name] = new OptimizeEffectiveValue
++                {
++                    Value = value,
++                    Source = source,
++                    SavedValue = savedValue,
++                    EnvironmentText = environmentText,
++                    EnvironmentError = environmentError
++                };
++            }
++
++            return new OptimizeSettings(values, null, null, checkForFinishedDownloadInterval);
++        }
++
++        // Copies used by tests and by the next3 test hooks (IndexerRateLimitOptions.Current, VideoFileInfoReader.ProbeTimeout).
++        internal OptimizeSettings WithRateLimit(IndexerRateLimitOptions rateLimit)
++        {
++            return new OptimizeSettings(_values, rateLimit, FfprobeTimeout, CheckForFinishedDownloadInterval);
++        }
++
++        internal OptimizeSettings WithFfprobeTimeout(TimeSpan timeout)
++        {
++            return new OptimizeSettings(_values, RateLimit, timeout, CheckForFinishedDownloadInterval);
++        }
++
++        internal OptimizeSettings With(string name, object value)
++        {
++            var tunable = OptimizeTunables.Get(name) ?? throw new ArgumentException("Unknown optimization setting " + name, nameof(name));
++            var values = new Dictionary<string, OptimizeEffectiveValue>(_values, StringComparer.OrdinalIgnoreCase)
++            {
++                [tunable.Name] = new OptimizeEffectiveValue
++                {
++                    Value = value is int number ? (long)number : value,
++                    Source = OptimizeValueSource.Database,
++                    SavedValue = value is int saved ? (long)saved : value
++                }
++            };
++
++            return new OptimizeSettings(values, null, null, CheckForFinishedDownloadInterval);
++        }
++
++        public object ValueOf(OptimizeTunable tunable)
++        {
++            if (!tunable.Editable)
++            {
++                return tunable.ReadOnlyValue?.Invoke(this) ?? tunable.DefaultValue;
++            }
++
++            if (tunable.Name == OptimizeTunables.IndexerRateLimitMs)
++            {
++                return (long)RateLimit.BaseRateLimit.TotalMilliseconds;
++            }
++
++            if (tunable.Name == OptimizeTunables.CacheHitHeader)
++            {
++                return RateLimit.CacheHitHeader ?? string.Empty;
++            }
++
++            if (tunable.Name == OptimizeTunables.CacheHitValue)
++            {
++                return RateLimit.CacheHitValue;
++            }
++
++            if (tunable.Name == OptimizeTunables.GrabSpacingMs)
++            {
++                return (long)RateLimit.GrabSpacing.TotalMilliseconds;
++            }
++
++            if (tunable.Name == OptimizeTunables.FfprobeTimeoutMinutes)
++            {
++                return (long)FfprobeTimeout.TotalMinutes;
++            }
++
++            // Never more than the whole cache: the size in effect, not the saved one.
++            if (tunable.Name == OptimizeTunables.FfprobeCacheMaxEntryKilobytes)
++            {
++                return FfprobeCache.MaxEntryBytes / 1024;
++            }
++
++            return _values[tunable.Name].Value;
++        }
++
++        private long Long(string name)
++        {
++            return (long)_values[name].Value;
++        }
++
++        private string Text(string name)
++        {
++            return (string)_values[name].Value;
++        }
++
++        private bool Bool(string name)
++        {
++            return (bool)_values[name].Value;
++        }
++    }
++
++    // The optimization environment variables, parsed once. Invalid values are logged and ignored.
++    public sealed class OptimizeEnvironment
++    {
++        public static readonly OptimizeEnvironment Empty = new OptimizeEnvironment();
++
++        public Dictionary<string, object> Values { get; } = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
++        public Dictionary<string, string> Texts { get; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
++        public Dictionary<string, string> Errors { get; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
++
++        public static OptimizeEnvironment Read(Func<string, string> getVariable, Logger logger)
++        {
++            var environment = new OptimizeEnvironment();
++
++            foreach (var tunable in OptimizeTunables.Editable.Where(t => t.EnvironmentVariable != null))
++            {
++                var text = getVariable(tunable.EnvironmentVariable);
++
++                if (string.IsNullOrWhiteSpace(text))
++                {
++                    continue;
++                }
++
++                environment.Texts[tunable.Name] = text;
++
++                var error = tunable.TryParse(text, true, out var value);
++
++                if (error != null)
++                {
++                    environment.Errors[tunable.Name] = error;
++                    logger?.Warn("Ignoring {0}='{1}': {2}. Using the value from the Optimize settings page or the default.", tunable.EnvironmentVariable, text, error);
++
++                    continue;
++                }
++
++                environment.Values[tunable.Name] = value;
++                logger?.Info("{0} is {1}{2}, set by environment variable {3}", tunable.Label, tunable.Format(value), tunable.Unit == null ? string.Empty : " " + tunable.Unit, tunable.EnvironmentVariable);
++            }
++
++            return environment;
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/Optimize/OptimizeSettingsService.cs b/src/NzbDrone.Core/Optimize/OptimizeSettingsService.cs
+new file mode 100644
+index 000000000..133bf3b68
+--- /dev/null
++++ b/src/NzbDrone.Core/Optimize/OptimizeSettingsService.cs
+@@ -0,0 +1,412 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using NLog;
++using NzbDrone.Core.Configuration;
++using NzbDrone.Core.Configuration.Events;
++using NzbDrone.Core.CustomFormats;
++using NzbDrone.Core.Indexers;
++using NzbDrone.Core.Lifecycle;
++using NzbDrone.Core.MediaFiles.MediaInfo;
++using NzbDrone.Core.Messaging.Events;
++
++namespace NzbDrone.Core.Optimize
++{
++    public interface IOptimizeSettingsService
++    {
++        OptimizeSettings Current { get; }
++
++        // Reads the saved values again, publishes the new settings and applies changed cache limits.
++        OptimizeSettings Reload();
++
++        // Validation messages by tunable name for values that would be saved (locked and read-only tunables are skipped).
++        Dictionary<string, string> Validate(IDictionary<string, object> values);
++
++        // Saves values by tunable name and applies them at once. Locked (environment) and read-only tunables are
++        // ignored, as are tunables not in the dictionary. Null, or the default value, clears the saved value (the
++        // source becomes "default"). The API leaves null values out (null = unchanged there, like the stock config
++        // endpoints), so through the API the default value is what resets a value.
++        OptimizeSettings Save(IDictionary<string, object> values);
++
++        List<OptimizeSettingInfo> GetSettings();
++        OptimizeStatus GetStatus();
++    }
++
++    public class OptimizeSettingsService : IOptimizeSettingsService, IHandle<ApplicationStartedEvent>, IHandle<ConfigSavedEvent>
++    {
++        private readonly IConfigService _configService;
++        private readonly IVideoFileInfoReader _videoFileInfoReader;
++        private readonly Logger _logger;
++        private readonly object _reloadLock = new object();
++
++        public OptimizeSettingsService(IConfigService configService, IVideoFileInfoReader videoFileInfoReader, Logger logger)
++        {
++            _configService = configService;
++            _videoFileInfoReader = videoFileInfoReader;
++            _logger = logger;
++        }
++
++        public OptimizeSettings Current => OptimizeSettings.Current;
++
++        public OptimizeSettings Reload()
++        {
++            lock (_reloadLock)
++            {
++                var previous = OptimizeSettings.Current;
++
++                // A copy of the saved values: later rebuilds (tests) never read the database under the settings lock.
++                var saved = OptimizeTunables.Editable.ToDictionary(t => t.ConfigKey, t => _configService.GetOptimizeValue(t.ConfigKey), StringComparer.OrdinalIgnoreCase);
++                var settings = OptimizeSettings.Load(key => saved.TryGetValue(key, out var value) ? value : null, _configService.CheckForFinishedDownloadInterval);
++
++                ApplyLimits();
++                LogChanges(previous, settings);
++
++                return settings;
++            }
++        }
++
++        public Dictionary<string, string> Validate(IDictionary<string, object> values)
++        {
++            var errors = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
++            var current = OptimizeSettings.Current;
++
++            foreach (var tunable in OptimizeTunables.Editable)
++            {
++                if (!TryGetValue(values, tunable, out var value) || value == null || current.IsLocked(tunable.Name))
++                {
++                    continue;
++                }
++
++                var error = tunable.TryParse(tunable.Format(value), false, out _);
++
++                if (error != null)
++                {
++                    errors[tunable.Name] = error;
++                }
++            }
++
++            return errors;
++        }
++
++        public OptimizeSettings Save(IDictionary<string, object> values)
++        {
++            lock (_reloadLock)
++            {
++                var errors = Validate(values);
++
++                if (errors.Any())
++                {
++                    throw new ArgumentException(string.Join("; ", errors.Values));
++                }
++
++                var current = OptimizeSettings.Current;
++
++                foreach (var tunable in OptimizeTunables.Editable)
++                {
++                    if (!TryGetValue(values, tunable, out var value) || current.IsLocked(tunable.Name))
++                    {
++                        continue;
++                    }
++
++                    string text = null;
++
++                    if (value != null)
++                    {
++                        tunable.TryParse(tunable.Format(value), false, out var parsed);
++
++                        // The default is not saved, so the value follows the default (and its source shows "default").
++                        if (!Equals(parsed, tunable.DefaultValue) && !(parsed is string s && s.Length == 0))
++                        {
++                            text = tunable.Format(parsed);
++                        }
++                    }
++
++                    if (_configService.GetOptimizeValue(tunable.ConfigKey) != text)
++                    {
++                        _configService.SetOptimizeValue(tunable.ConfigKey, text);
++                    }
++                }
++
++                return Reload();
++            }
++        }
++
++        public List<OptimizeSettingInfo> GetSettings()
++        {
++            var settings = OptimizeSettings.Current;
++
++            return OptimizeTunables.All.Select(t => ToInfo(t, settings)).ToList();
++        }
++
++        public OptimizeStatus GetStatus()
++        {
++            var settings = OptimizeSettings.Current;
++            var rateLimit = settings.RateLimit;
++            var reader = _videoFileInfoReader as VideoFileInfoReader;
++            var probeCache = reader?.ProbeCache;
++
++            var status = new OptimizeStatus
++            {
++                StartedUtc = OptimizeCounters.StartedUtc,
++                Features = new List<OptimizeFeature>
++                {
++                    Feature("Custom-format match cache", "Remembers which custom formats match a release; scores and decisions stay live.",
++                        settings.CustomFormatCacheCapacity > 0, $"On, up to {settings.CustomFormatCacheCapacity:N0} entries"),
++                    Feature("Per-search indexer memo", "Each indexer definition is read once per search or RSS sync.", settings.DecisionBatchMemo, "On"),
++                    Feature("Release profile cache", "Release profiles stay in memory until the next change.", settings.ReleaseProfileCache, "On"),
++                    Feature("Indexer settings type lookup", "The settings type of each provider row is looked up once per type.", true, "On"),
++                    Feature("Faster movie statistics", "Movie statistics match file totals with a lookup instead of a scan.", true, "On"),
++                    Feature("ffprobe result cache", "Media info of an unchanged file is reused instead of running ffprobe again.",
++                        settings.FfprobeCache.Enabled, $"On, up to {settings.FfprobeCache.Capacity:N0} files / {settings.FfprobeCache.MaxBytes / (1024 * 1024)} MB"),
++                    Feature("ffprobe timeout", "A hung ffprobe is stopped and the file gets no media info.", settings.FfprobeTimeout > TimeSpan.Zero,
++                        $"{settings.FfprobeTimeout.TotalMinutes:0} minutes"),
++                    Feature("Indexer request spacing", "Minimum time between requests to one indexer.", true,
++                        rateLimit.BaseRateLimit == IndexerRateLimitOptions.StockRateLimit ? "Stock, 2000 ms" : $"{rateLimit.BaseRateLimit.TotalMilliseconds:0} ms (stock 2000 ms)"),
++                    Feature("Cache hit refund", "A response served by a cache in front of the indexer gives its wait back.", rateLimit.RefundsCacheHits,
++                        rateLimit.RefundsCacheHits ? $"On, {rateLimit.CacheHitHeader}: {rateLimit.CacheHitValue}" : "Off"),
++                    Feature("Grab spacing", "Minimum time between grabs from one host.", true,
++                        rateLimit.GrabSpacing == IndexerRateLimitOptions.GrabRateLimit ? "Stock, 2000 ms" : $"{rateLimit.GrabSpacing.TotalMilliseconds:0} ms (stock 2000 ms)"),
++                    Feature("Import retry after an error", "A download whose import throws goes back to import pending instead of staying stuck.", true, "On"),
++                    Feature("Lost movie link recovery", "A finished download whose movie link was lost is completed from its import results or history.", true, "On"),
++                    Feature("Scheduler timer per instance", "In-app restarts no longer stack scheduler timers.", true, "On"),
++                    Feature("Duplicate extra files", "Replacing an -orig metadata file leaves no duplicate row; a daily cleanup removes old duplicates.", true, "On"),
++                    Feature("Exclusive housekeeping", "Housekeeping and its VACUUM start only when no other command runs.", true, "On"),
++                    Feature("Safe database restore", "Only a Radarr database or config is accepted; the previous database is kept until start-up.", true, "On")
++                },
++                Counters = new List<OptimizeCounter>
++                {
++                    Counter("customFormatCacheEntries", "Custom format cache entries", CustomFormatMatchCache.Count, null),
++                    Counter("customFormatCacheHits", "Custom format cache hits", CustomFormatMatchCache.ReadCounter(ref CustomFormatMatchCache.Hits), null),
++                    Counter("customFormatCacheMisses", "Custom format cache misses", CustomFormatMatchCache.ReadCounter(ref CustomFormatMatchCache.Misses), null),
++                    Counter("customFormatCacheEvictions", "Custom format cache entries dropped (full)", CustomFormatMatchCache.ReadCounter(ref CustomFormatMatchCache.Evictions), null),
++                    Counter("customFormatCacheExpirations", "Custom format cache entries dropped (idle)", CustomFormatMatchCache.ReadCounter(ref CustomFormatMatchCache.Expirations), null),
++                    Counter("ffprobeCacheEntries", "ffprobe cache entries", probeCache?.Count ?? 0, null),
++                    Counter("ffprobeCacheBytes", "ffprobe cache memory (estimated)", (probeCache?.Bytes ?? 0) / 1024, "KB"),
++                    Counter("ffprobeCacheHits", "ffprobe cache hits (ffprobe runs saved)", probeCache == null ? 0 : OptimizeCounters.Read(ref probeCache.Hits), null),
++                    Counter("ffprobeCacheMisses", "ffprobe cache misses", probeCache == null ? 0 : OptimizeCounters.Read(ref probeCache.Misses), null),
++                    Counter("ffprobeTimeouts", "ffprobe runs stopped by the timeout", OptimizeCounters.Read(ref OptimizeCounters.FfprobeTimeouts), null),
++                    Counter("cacheHitResponses", "Indexer responses marked as cache hits", OptimizeCounters.Read(ref OptimizeCounters.CacheHitResponses), null),
++                    Counter("rateLimitRefunds", "Rate-limit waits given back (cache hits)", OptimizeCounters.Read(ref OptimizeCounters.Refunds), null),
++                    Counter("rateLimitRefundsKept", "Cache hits whose wait was kept (next slot already taken)", OptimizeCounters.Read(ref OptimizeCounters.RefundsKept), null),
++                    Counter("rateLimitTimeSaved", "Wait time given back by cache hits", OptimizeCounters.Read(ref OptimizeCounters.RefundedTicks) / TimeSpan.TicksPerMillisecond, "ms"),
++                    Counter("pacedRequests", "Indexer requests paced by the cache-hit limiter", OptimizeCounters.Read(ref OptimizeCounters.PacedRequests), null),
++                    Counter("pacedRequestsWaited", "...of which waited for the rate limit", OptimizeCounters.Read(ref OptimizeCounters.PacedRequestsWaited), null),
++                    Counter("pacedWaitTime", "...total time they waited", OptimizeCounters.Read(ref OptimizeCounters.PacedWaitTicks) / TimeSpan.TicksPerMillisecond, "ms")
++                }
++            };
++
++            return status;
++        }
++
++        public void Handle(ApplicationStartedEvent message)
++        {
++            Reload();
++        }
++
++        public void Handle(ConfigSavedEvent message)
++        {
++            Reload();
++        }
++
++        private static bool TryGetValue(IDictionary<string, object> values, OptimizeTunable tunable, out object value)
++        {
++            foreach (var pair in values)
++            {
++                if (string.Equals(pair.Key, tunable.Name, StringComparison.OrdinalIgnoreCase))
++                {
++                    value = pair.Value;
++
++                    return true;
++                }
++            }
++
++            value = null;
++
++            return false;
++        }
++
++        private void ApplyLimits()
++        {
++            CustomFormatMatchCache.ApplyLimits();
++            (_videoFileInfoReader as VideoFileInfoReader)?.ApplyCacheLimits();
++        }
++
++        private void LogChanges(OptimizeSettings previous, OptimizeSettings settings)
++        {
++            foreach (var tunable in OptimizeTunables.Editable)
++            {
++                var before = previous.ValueOf(tunable);
++                var after = settings.ValueOf(tunable);
++
++                if (!Equals(before, after))
++                {
++                    var source = settings[tunable.Name].Source;
++                    var unit = tunable.Unit == null ? string.Empty : " " + tunable.Unit;
++
++                    _logger.Info("{0} is now {1}{2}, {3}", tunable.Label, tunable.Format(after), unit,
++                        source == OptimizeValueSource.Default ? "the default" : $"{SourceText(tunable, source)} (default {tunable.Format(tunable.DefaultValue)}{unit})");
++                }
++            }
++        }
++
++        private static OptimizeFeature Feature(string name, string description, bool active, string state)
++        {
++            return new OptimizeFeature { Name = name, Description = description, Active = active, State = active ? state : "Off" };
++        }
++
++        private static OptimizeCounter Counter(string name, string label, long value, string unit)
++        {
++            return new OptimizeCounter { Name = name, Label = label, Value = value, Unit = unit };
++        }
++
++        internal static string SourceText(OptimizeTunable tunable, OptimizeValueSource source)
++        {
++            return source switch
++            {
++                OptimizeValueSource.Environment => $"environment variable {tunable.EnvironmentVariable}",
++                OptimizeValueSource.Database => "saved on this page",
++                OptimizeValueSource.Fixed => "fixed in this build",
++                _ => "default"
++            };
++        }
++
++        private static OptimizeSettingInfo ToInfo(OptimizeTunable tunable, OptimizeSettings settings)
++        {
++            var info = new OptimizeSettingInfo
++            {
++                Name = tunable.Name,
++                Label = tunable.Label,
++                Section = tunable.Section,
++                Main = tunable.Main,
++                Editable = tunable.Editable,
++                Kind = tunable.Kind.ToString().ToLowerInvariant(),
++                Unit = tunable.Unit,
++                Description = tunable.Description,
++                Warning = tunable.Warning,
++                WarnBelow = tunable.WarnBelow,
++                WarnAbove = tunable.WarnAbove,
++                ZeroMeans = tunable.ZeroMeans,
++                EnvironmentVariable = tunable.EnvironmentVariable,
++                Constants = tunable.Constants.ToList(),
++                DefaultValue = tunable.DefaultValue,
++                Value = settings.ValueOf(tunable)
++            };
++
++            if (tunable.Kind == OptimizeValueKind.Integer && tunable.Editable)
++            {
++                info.Min = tunable.Min;
++                info.Max = tunable.Max;
++            }
++
++            if (!tunable.Editable)
++            {
++                info.Source = OptimizeValueSource.Fixed.ToString().ToLowerInvariant();
++                info.SourceText = "Fixed in this build";
++                info.HowToChange = tunable.HowToChange;
++                info.Risky = false;
++
++                return info;
++            }
++
++            var effective = settings[tunable.Name];
++            info.Source = effective.Source.ToString().ToLowerInvariant();
++            info.Locked = effective.Source == OptimizeValueSource.Environment;
++            info.SavedValue = effective.SavedValue;
++            info.EnvironmentValue = effective.EnvironmentText;
++            info.EnvironmentError = effective.EnvironmentError;
++            info.Risky = tunable.IsRisky(info.Value);
++
++            // The value set (environment or page) is capped by another setting: say what is used.
++            if (!Equals(info.Value, effective.Value))
++            {
++                var unit = tunable.Unit == null ? string.Empty : " " + tunable.Unit;
++                info.Note = $"In effect: {tunable.Format(info.Value)}{unit}. The value set ({tunable.Format(effective.Value)}{unit}) is capped because {tunable.CappedBy ?? "of another setting"}.";
++            }
++
++            var environmentHint = tunable.EnvironmentVariable == null
++                ? string.Empty
++                : $" or set environment variable {tunable.EnvironmentVariable} on the container and recreate it";
++
++            switch (effective.Source)
++            {
++                case OptimizeValueSource.Environment:
++                    info.SourceText = $"Set by environment variable {tunable.EnvironmentVariable}";
++                    info.HowToChange = $"Change or remove environment variable {tunable.EnvironmentVariable} on the container and recreate it; " +
++                                       "while it is set, this page cannot change the value." +
++                                       (effective.SavedValue != null ? $" A value saved on this page ({tunable.Format(effective.SavedValue)}) is used once the variable is removed." : string.Empty);
++                    break;
++                case OptimizeValueSource.Database:
++                    info.SourceText = "Saved on this page";
++                    info.HowToChange = "Change it on this page (applies at once, no restart)" + environmentHint + ".";
++                    break;
++                default:
++                    info.SourceText = "Default";
++                    info.HowToChange = "Change it on this page (applies at once, no restart)" + environmentHint + ".";
++                    break;
++            }
++
++            if (effective.EnvironmentError != null)
++            {
++                info.HowToChange += $" Environment variable {tunable.EnvironmentVariable} is set to '{effective.EnvironmentText}' but ignored: {effective.EnvironmentError}.";
++            }
++
++            return info;
++        }
++    }
++
++    public class OptimizeSettingInfo
++    {
++        public string Name { get; set; }
++        public string Label { get; set; }
++        public string Section { get; set; }
++        public bool Main { get; set; }
++        public bool Editable { get; set; }
++        public string Kind { get; set; }
++        public string Unit { get; set; }
++        public long? Min { get; set; }
++        public long? Max { get; set; }
++        public object Value { get; set; }
++        public object DefaultValue { get; set; }
++        public object SavedValue { get; set; }
++        public string Source { get; set; }
++        public string SourceText { get; set; }
++        public bool Locked { get; set; }
++        public string EnvironmentVariable { get; set; }
++        public string EnvironmentValue { get; set; }
++        public string EnvironmentError { get; set; }
++        public string Description { get; set; }
++        public string Warning { get; set; }
++        public long? WarnBelow { get; set; }
++        public long? WarnAbove { get; set; }
++        public bool Risky { get; set; }
++        public string ZeroMeans { get; set; }
++        public string HowToChange { get; set; }
++
++        // Set when the value in effect differs from the value set (capped by another setting).
++        public string Note { get; set; }
++        public List<string> Constants { get; set; }
++    }
++
++    public class OptimizeStatus
++    {
++        public DateTime StartedUtc { get; set; }
++        public List<OptimizeFeature> Features { get; set; }
++        public List<OptimizeCounter> Counters { get; set; }
++    }
++
++    public class OptimizeFeature
++    {
++        public string Name { get; set; }
++        public string Description { get; set; }
++        public bool Active { get; set; }
++        public string State { get; set; }
++    }
++
++    public class OptimizeCounter
++    {
++        public string Name { get; set; }
++        public string Label { get; set; }
++        public long Value { get; set; }
++        public string Unit { get; set; }
++    }
++}
+diff --git a/src/NzbDrone.Core/Optimize/OptimizeTunable.cs b/src/NzbDrone.Core/Optimize/OptimizeTunable.cs
+new file mode 100644
+index 000000000..b99351c6e
+--- /dev/null
++++ b/src/NzbDrone.Core/Optimize/OptimizeTunable.cs
+@@ -0,0 +1,179 @@
++using System;
++using System.Globalization;
++
++namespace NzbDrone.Core.Optimize
++{
++    public enum OptimizeValueKind
++    {
++        Integer,
++        Text,
++        Boolean
++    }
++
++    public enum OptimizeValueSource
++    {
++        // Not set anywhere: the built-in default.
++        Default,
++
++        // Saved on the Optimize settings page (Config table, key "optimize<Name>").
++        Database,
++
++        // Set by the environment variable of the setting; the page shows it read-only.
++        Environment,
++
++        // Cannot be changed while the app runs (fixed in this build, or derived from another setting).
++        Fixed
++    }
++
++    // One tunable value of the optimization patches: its bounds, default, environment variable, and the text the
++    // Optimize page shows for it. Editable tunables are stored in the Config table as "optimize<Name>".
++    public class OptimizeTunable
++    {
++        public string Name { get; init; }
++        public string Label { get; init; }
++        public string Section { get; init; }
++
++        // Shown in the top "Optimize" fieldset (the four main settings); the others are under "Advanced tuning".
++        public bool Main { get; init; }
++        public bool Editable { get; init; } = true;
++        public OptimizeValueKind Kind { get; init; }
++        public string Unit { get; init; }
++
++        // Bounds of a value saved on the page.
++        public long Min { get; init; }
++        public long Max { get; init; }
++
++        // Bounds of the environment variable, when they differ from the page (kept from earlier releases).
++        public long? EnvironmentMin { get; init; }
++        public long? EnvironmentMax { get; init; }
++
++        // long for Integer, string for Text, bool for Boolean.
++        public object DefaultValue { get; init; }
++        public string EnvironmentVariable { get; init; }
++        public string Description { get; init; }
++
++        // Shown next to the field when the value is in the risky range (below WarnBelow, above WarnAbove, or for a
++        // Boolean when it is not the default).
++        public string Warning { get; init; }
++        public long? WarnBelow { get; init; }
++        public long? WarnAbove { get; init; }
++
++        // Why the value in effect can be lower than the one set (shown when it is).
++        public string CappedBy { get; init; }
++
++        // What a value of 0 means, when 0 is special ("disables the cache").
++        public string ZeroMeans { get; init; }
++
++        // The code constants this tunable replaces or derives from ("Class.Member"); their values are the defaults.
++        public string[] Constants { get; init; } = Array.Empty<string>();
++
++        // For a value that cannot be changed on the page: why, and how to change it.
++        public string HowToChange { get; init; }
++
++        // For read-only rows: the value in effect, computed at runtime.
++        public Func<OptimizeSettings, object> ReadOnlyValue { get; init; }
++
++        public string ConfigKey => "Optimize" + char.ToUpperInvariant(Name[0]) + Name.Substring(1);
++
++        public long MinFor(bool fromEnvironment)
++        {
++            return fromEnvironment && EnvironmentMin.HasValue ? EnvironmentMin.Value : Min;
++        }
++
++        public long MaxFor(bool fromEnvironment)
++        {
++            return fromEnvironment && EnvironmentMax.HasValue ? EnvironmentMax.Value : Max;
++        }
++
++        // Parses and validates a value. Returns null when valid, otherwise a message for the user.
++        public string TryParse(string text, bool fromEnvironment, out object value)
++        {
++            value = null;
++            var trimmed = text?.Trim() ?? string.Empty;
++
++            switch (Kind)
++            {
++                case OptimizeValueKind.Integer:
++                    {
++                        var min = MinFor(fromEnvironment);
++                        var max = MaxFor(fromEnvironment);
++
++                        // Digits only: no sign, no decimals, no thousands separators.
++                        if (!long.TryParse(trimmed, NumberStyles.None, CultureInfo.InvariantCulture, out var number) || number < min || number > max)
++                        {
++                            return string.Format(CultureInfo.InvariantCulture, "{0} must be a whole number from {1} to {2}", Label, min, max);
++                        }
++
++                        value = number;
++
++                        return null;
++                    }
++
++                case OptimizeValueKind.Boolean:
++                    {
++                        if (trimmed.Equals("true", StringComparison.OrdinalIgnoreCase) || trimmed.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
++                            trimmed.Equals("on", StringComparison.OrdinalIgnoreCase) || trimmed == "1")
++                        {
++                            value = true;
++
++                            return null;
++                        }
++
++                        if (trimmed.Equals("false", StringComparison.OrdinalIgnoreCase) || trimmed.Equals("no", StringComparison.OrdinalIgnoreCase) ||
++                            trimmed.Equals("off", StringComparison.OrdinalIgnoreCase) || trimmed == "0")
++                        {
++                            value = false;
++
++                            return null;
++                        }
++
++                        return $"{Label} must be true or false";
++                    }
++
++                default:
++                    {
++                        var error = OptimizeTunables.ValidateText(this, trimmed);
++
++                        if (error == null)
++                        {
++                            value = trimmed;
++                        }
++
++                        return error;
++                    }
++            }
++        }
++
++        public string Format(object value)
++        {
++            return value switch
++            {
++                null => string.Empty,
++                bool b => b ? "true" : "false",
++                long l => l.ToString(CultureInfo.InvariantCulture),
++                int i => i.ToString(CultureInfo.InvariantCulture),
++                _ => value.ToString()
++            };
++        }
++
++        public bool IsRisky(object value)
++        {
++            if (Warning == null || value == null)
++            {
++                return false;
++            }
++
++            if (Kind == OptimizeValueKind.Boolean)
++            {
++                return !Equals(value, DefaultValue);
++            }
++
++            if (value is long number)
++            {
++                return (WarnBelow.HasValue && number < WarnBelow.Value) || (WarnAbove.HasValue && number > WarnAbove.Value);
++            }
++
++            return false;
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/Optimize/OptimizeTunables.cs b/src/NzbDrone.Core/Optimize/OptimizeTunables.cs
+new file mode 100644
+index 000000000..3338f5799
+--- /dev/null
++++ b/src/NzbDrone.Core/Optimize/OptimizeTunables.cs
+@@ -0,0 +1,510 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Reflection;
++using NzbDrone.Core.CustomFormats;
++using NzbDrone.Core.Indexers;
++using NzbDrone.Core.MediaFiles.MediaInfo;
++
++namespace NzbDrone.Core.Optimize
++{
++    // Every value the optimization patches add or rely on. The Optimize page and its API list exactly these, with their
++    // effective values computed at runtime, so the page cannot drift from the code. A new tunable is added here.
++    public static class OptimizeTunables
++    {
++        public const string IndexerRateLimitMs = "indexerRateLimitMs";
++        public const string CacheHitHeader = "cacheHitHeader";
++        public const string CacheHitValue = "cacheHitValue";
++        public const string FfprobeTimeoutMinutes = "ffprobeTimeoutMinutes";
++
++        public const string GrabSpacingMs = "grabSpacingMs";
++        public const string CustomFormatCacheCapacity = "customFormatCacheCapacity";
++        public const string CustomFormatCacheExpiryMinutes = "customFormatCacheExpiryMinutes";
++        public const string CustomFormatCacheMaxInputChars = "customFormatCacheMaxInputChars";
++        public const string DecisionBatchMemo = "decisionBatchMemo";
++        public const string ReleaseProfileCache = "releaseProfileCache";
++        public const string FfprobeCacheEntries = "ffprobeCacheEntries";
++        public const string FfprobeCacheMaxMegabytes = "ffprobeCacheMaxMegabytes";
++        public const string FfprobeCacheMaxEntryKilobytes = "ffprobeCacheMaxEntryKilobytes";
++        public const string FfprobeCacheFailureMinutes = "ffprobeCacheFailureMinutes";
++        public const string FfprobeCacheIdleMinutes = "ffprobeCacheIdleMinutes";
++        public const string FfprobeCacheSettleSeconds = "ffprobeCacheSettleSeconds";
++        public const string FfprobeCacheUnsettledSeconds = "ffprobeCacheUnsettledSeconds";
++        public const string FfprobeCacheSweepSeconds = "ffprobeCacheSweepSeconds";
++
++        public const string FfprobeCacheEvictionBatch = "ffprobeCacheEvictionBatch";
++        public const string IndexerBuiltInLimits = "indexerBuiltInLimits";
++        public const string ImportRetryInterval = "importRetryInterval";
++        public const string ProviderSettingsTypeCache = "providerSettingsTypeCache";
++        public const string HousekeepingMaxDeferral = "housekeepingMaxDeferral";
++
++        public const string FfprobeTimeoutVariable = "ARR_FFPROBE_TIMEOUT_MINUTES";
++
++        // The default ffprobe timeout: next3 shipped a fixed 5 minutes, which stopped slow probes of large remote files.
++        public const int DefaultFfprobeTimeoutMinutes = 15;
++
++        public static readonly IReadOnlyList<OptimizeTunable> All = Build();
++
++        public static readonly IReadOnlyList<OptimizeTunable> Editable = All.Where(t => t.Editable).ToList();
++
++        private static readonly Dictionary<string, OptimizeTunable> ByName = All.ToDictionary(t => t.Name, StringComparer.OrdinalIgnoreCase);
++
++        public static OptimizeTunable Get(string name)
++        {
++            return ByName.TryGetValue(name, out var tunable) ? tunable : null;
++        }
++
++        internal static string ValidateText(OptimizeTunable tunable, string text)
++        {
++            if (tunable.Name == CacheHitHeader)
++            {
++                if (text.Length == 0)
++                {
++                    return null;
++                }
++
++                if (text.Length > 256 || !IsHeaderName(text))
++                {
++                    return "Cache hit header must be a valid HTTP header name (letters, digits and !#$%&'*+-.^_`|~ only), at most 256 characters";
++                }
++
++                return null;
++            }
++
++            if (tunable.Name == CacheHitValue)
++            {
++                if (text.Length == 0)
++                {
++                    return null;
++                }
++
++                if (text.Length > 256 || text.IndexOfAny(new[] { ',', ';' }) >= 0 || text.Any(char.IsControl))
++                {
++                    return "Cache hit value must be a single value without ',' or ';', at most 256 characters";
++                }
++
++                return null;
++            }
++
++            return null;
++        }
++
++        // RFC 9110 token characters.
++        private static bool IsHeaderName(string name)
++        {
++            foreach (var c in name)
++            {
++                var isToken = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || "!#$%&'*+-.^_`|~".IndexOf(c) >= 0;
++
++                if (!isToken)
++                {
++                    return false;
++                }
++            }
++
++            return name.Length > 0;
++        }
++
++        private static List<OptimizeTunable> Build()
++        {
++            var list = new List<OptimizeTunable>
++            {
++                new OptimizeTunable
++                {
++                    Name = IndexerRateLimitMs,
++                    Label = "Indexer request spacing",
++                    Section = "Indexers",
++                    Main = true,
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "ms",
++                    Min = 0,
++                    Max = 10_000,
++                    EnvironmentMax = (long)TimeSpan.FromDays(1).TotalMilliseconds,
++                    DefaultValue = (long)IndexerRateLimitOptions.StockRateLimit.TotalMilliseconds,
++                    EnvironmentVariable = IndexerRateLimitOptions.RateLimitVariable,
++                    Description = "The minimum time between two requests to the same indexer (searches, RSS and paging). Stock is 2000 ms. " +
++                                  "Indexer types with their own built-in limit (PassThePopcorn: 4000 ms) keep it. If your indexers are added " +
++                                  "through Prowlarr, Prowlarr still applies its own limits to the real indexers.",
++                    Warning = "Lower than stock: an indexer you reach directly may rate-limit you (HTTP 429) and return fewer results. " +
++                              "Only lower it for indexers that allow it, for example a local Prowlarr or a caching proxy.",
++                    WarnBelow = (long)IndexerRateLimitOptions.StockRateLimit.TotalMilliseconds,
++                    Constants = new[] { "IndexerRateLimitOptions.StockRateLimit", "HttpIndexerBase.RateLimit" }
++                },
++                new OptimizeTunable
++                {
++                    Name = CacheHitHeader,
++                    Label = "Cache hit header",
++                    Section = "Indexers",
++                    Main = true,
++                    Kind = OptimizeValueKind.Text,
++                    DefaultValue = string.Empty,
++                    EnvironmentVariable = IndexerRateLimitOptions.CacheHitHeaderVariable,
++                    Description = "When an indexer response carries this header with the cache hit value, the next request to that indexer " +
++                                  "does not wait: the answer came from a cache in front of the indexer, so the real indexer was not contacted. " +
++                                  "Empty turns it off (stock). Example: X-Search-Cache. Grabs still wait as on stock."
++                },
++                new OptimizeTunable
++                {
++                    Name = CacheHitValue,
++                    Label = "Cache hit value",
++                    Section = "Indexers",
++                    Main = true,
++                    Kind = OptimizeValueKind.Text,
++                    DefaultValue = IndexerRateLimitOptions.DefaultCacheHitValue,
++                    EnvironmentVariable = IndexerRateLimitOptions.CacheHitValueVariable,
++                    Description = "The value of the cache hit header that means the answer was served from the cache (compared without case). " +
++                                  "Every value of the header must say this. Example: HIT. Has no effect while the cache hit header is empty.",
++                    Constants = new[] { "IndexerRateLimitOptions.DefaultCacheHitValue" }
++                },
++                new OptimizeTunable
++                {
++                    Name = FfprobeTimeoutMinutes,
++                    Label = "ffprobe timeout",
++                    Section = "Media info",
++                    Main = true,
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "minutes",
++                    Min = 0,
++                    Max = 1440,
++                    DefaultValue = (long)DefaultFfprobeTimeoutMinutes,
++                    EnvironmentVariable = FfprobeTimeoutVariable,
++                    ZeroMeans = "no timeout (stock: a hung ffprobe blocks the import and its command thread forever)",
++                    Description = "How long reading one file's media info with ffprobe may take. When it takes longer, ffprobe is stopped and the " +
++                                  "file gets no media info: an import of that file is rejected as \"Unable to determine if file is a sample\" and is " +
++                                  "tried again on a later check of the download (about once a minute), and a rescan leaves the file without media info " +
++                                  "until the next rescan. While the file does not change, the failed probe is remembered for the ffprobe failure " +
++                                  "lifetime (10 minutes by default), so it is probed again only after that. 0 = no timeout (stock).",
++                    Warning = "A short timeout can stop probes of large files on slow or network storage, and those files are then not imported " +
++                              "until a later probe finishes in time.",
++                    WarnBelow = 5,
++                    Constants = new[] { "OptimizeTunables.DefaultFfprobeTimeoutMinutes", "VideoFileInfoReader.DefaultProbeTimeout", "VideoFileInfoReader.ProbeTimeout" }
++                },
++                new OptimizeTunable
++                {
++                    Name = GrabSpacingMs,
++                    Label = "Grab spacing",
++                    Section = "Grabs",
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "ms",
++                    Min = 0,
++                    Max = 60_000,
++                    DefaultValue = (long)IndexerRateLimitOptions.GrabRateLimit.TotalMilliseconds,
++                    EnvironmentVariable = "ARR_GRAB_SPACING_MS",
++                    Description = "The minimum time between two grabs (.torrent or .nzb downloads) from the same host. Stock is 2000 ms; at 2000 ms " +
++                                  "grabs are paced with exactly the stock call. Magnet links are not paced.",
++                    Warning = "Below 2000 ms your download hosts or indexers may rate-limit or ban you.",
++                    WarnBelow = (long)IndexerRateLimitOptions.GrabRateLimit.TotalMilliseconds,
++                    Constants = new[] { "IndexerRateLimitOptions.GrabRateLimit" }
++                },
++                new OptimizeTunable
++                {
++                    Name = CustomFormatCacheCapacity,
++                    Label = "Custom format cache entries",
++                    Section = "Custom formats",
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "entries",
++                    Min = 0,
++                    Max = 1_000_000,
++                    DefaultValue = (long)CustomFormatMatchCache.Capacity,
++                    EnvironmentVariable = "ARR_CF_CACHE_CAPACITY",
++                    ZeroMeans = "the cache is off: every release is matched against every custom format, as without the cache",
++                    Description = "How many release inputs the custom-format match cache remembers (which custom formats match a release). " +
++                                  "Scores and every decision are still computed live, and definition edits apply immediately. The least " +
++                                  "recently used entry is dropped when full. About 0.5 KB per entry: the default uses about 20-25 MB.",
++                    Warning = "Large values use more memory: roughly 0.5 KB per entry, so 1,000,000 entries can use about 500 MB.",
++                    WarnAbove = 200_000,
++                    Constants = new[] { "CustomFormatMatchCache.Capacity" }
++                },
++                new OptimizeTunable
++                {
++                    Name = CustomFormatCacheExpiryMinutes,
++                    Label = "Custom format cache expiry",
++                    Section = "Custom formats",
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "minutes",
++                    Min = 1,
++                    Max = 10_080,
++                    DefaultValue = CustomFormatMatchCache.SlidingMs / 60_000,
++                    EnvironmentVariable = "ARR_CF_CACHE_LIFETIME_MINUTES",
++                    Description = "An entry not used for this long is dropped; every use restarts its clock. This only bounds memory: " +
++                                  "an entry can never be out of date, because its key holds every input the custom formats read.",
++                    Warning = "Entries are kept longer, so the cache stays fuller and uses more memory between searches.",
++                    WarnAbove = 1440,
++                    Constants = new[] { "CustomFormatMatchCache.SlidingMs" }
++                },
++                new OptimizeTunable
++                {
++                    Name = CustomFormatCacheMaxInputChars,
++                    Label = "Custom format cache max input length",
++                    Section = "Custom formats",
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "characters",
++                    Min = 256,
++                    Max = 65_536,
++                    DefaultValue = (long)CustomFormatMatchCache.MaxTextLength,
++                    EnvironmentVariable = "ARR_CF_CACHE_MAX_KEY_CHARS",
++                    Description = "Releases whose text (title, file name, group, edition and languages together) is longer than this are " +
++                                  "matched without the cache, so unusually long inputs are not kept in memory.",
++                    Warning = "Long inputs are kept in memory; with many of them the cache uses more memory per entry.",
++                    WarnAbove = 16_384,
++                    Constants = new[] { "CustomFormatMatchCache.MaxTextLength" }
++                },
++                new OptimizeTunable
++                {
++                    Name = DecisionBatchMemo,
++                    Label = "Per-search indexer memo",
++                    Section = "Decisions",
++                    Kind = OptimizeValueKind.Boolean,
++                    DefaultValue = true,
++                    EnvironmentVariable = "ARR_DECISION_MEMO_ENABLED",
++                    Description = "Within one decision batch (one search or RSS sync), each indexer definition is read once instead of three " +
++                                  "times per release. Any indexer add, edit or delete during the batch is seen immediately. Off reads it on " +
++                                  "every use, as on stock (slower, same decisions).",
++                    Constants = new[] { "DecisionBatchCache" }
++                },
++                new OptimizeTunable
++                {
++                    Name = ReleaseProfileCache,
++                    Label = "Release profile cache",
++                    Section = "Decisions",
++                    Kind = OptimizeValueKind.Boolean,
++                    DefaultValue = true,
++                    EnvironmentVariable = "ARR_RELEASE_PROFILE_CACHE",
++                    Description = "Release profiles are kept in memory and reloaded after every add, edit or delete. Off reads them from the " +
++                                  "database for every release, as on stock (slower, same decisions).",
++                    Constants = new[] { "ReleaseProfileService" }
++                },
++                new OptimizeTunable
++                {
++                    Name = FfprobeCacheEntries,
++                    Label = "ffprobe cache entries",
++                    Section = "Media info",
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "files",
++                    Min = 0,
++                    Max = 100_000,
++                    DefaultValue = (long)MediaInfoProbeCache.Capacity,
++                    EnvironmentVariable = "ARR_FFPROBE_CACHE_CAPACITY",
++                    ZeroMeans = "the ffprobe cache is off: every media info read runs ffprobe, as on stock",
++                    Description = "How many files' ffprobe results are remembered. A result is reused only while the file's size and " +
++                                  "modification time (and, for a symlink, its final target and that target's modification time) are unchanged. " +
++                                  "When full, the least recently used tenth is dropped.",
++                    Warning = "Many entries use more memory; the memory limit below still applies.",
++                    WarnAbove = 20_000,
++                    Constants = new[] { "MediaInfoProbeCache.Capacity" }
++                },
++                new OptimizeTunable
++                {
++                    Name = FfprobeCacheMaxMegabytes,
++                    Label = "ffprobe cache memory limit",
++                    Section = "Media info",
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "MB",
++                    Min = 0,
++                    Max = 1024,
++                    DefaultValue = MediaInfoProbeCache.MaxBytes / (1024 * 1024),
++                    EnvironmentVariable = "ARR_FFPROBE_CACHE_MAX_MB",
++                    ZeroMeans = "the ffprobe cache is off",
++                    Description = "Upper bound of the estimated memory of all cached ffprobe results. A typical result is about 5 KB; files " +
++                                  "with many attachments can be over 100 KB.",
++                    Warning = "The cache can use this much memory.",
++                    WarnAbove = 256,
++                    Constants = new[] { "MediaInfoProbeCache.MaxBytes" }
++                },
++                new OptimizeTunable
++                {
++                    Name = FfprobeCacheMaxEntryKilobytes,
++                    Label = "ffprobe cache max result size",
++                    Section = "Media info",
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "KB",
++                    Min = 1,
++                    Max = 131_072,
++                    DefaultValue = MediaInfoProbeCache.MaxEntryBytes / 1024,
++                    EnvironmentVariable = "ARR_FFPROBE_CACHE_MAX_ENTRY_KB",
++                    Description = "A single ffprobe result larger than this is not cached at all. Never more than the memory limit.",
++                    CappedBy = "a single result can never be larger than the ffprobe cache memory limit",
++                    Warning = "One large result can take a big share of the cache.",
++                    WarnAbove = 65_536,
++                    Constants = new[] { "MediaInfoProbeCache.MaxEntryBytes" }
++                },
++                new OptimizeTunable
++                {
++                    Name = FfprobeCacheFailureMinutes,
++                    Label = "ffprobe failure lifetime",
++                    Section = "Media info",
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "minutes",
++                    Min = 0,
++                    Max = 1440,
++                    DefaultValue = MediaInfoProbeCache.FailureLifetimeMs / 60_000,
++                    EnvironmentVariable = "ARR_FFPROBE_CACHE_FAILURE_MINUTES",
++                    ZeroMeans = "failed probes are not remembered: the file is probed again every time, as on stock",
++                    Description = "How long a failed probe (including one stopped by the ffprobe timeout) of an unchanged file is remembered, " +
++                                  "so the file is not probed again before then. Only for files whose newest write is older than the settle time.",
++                    Warning = "A file that ffprobe can read again (for example after a network mount comes back) stays without media info longer.",
++                    WarnAbove = 60,
++                    Constants = new[] { "MediaInfoProbeCache.FailureLifetimeMs" }
++                },
++                new OptimizeTunable
++                {
++                    Name = FfprobeCacheIdleMinutes,
++                    Label = "ffprobe cache idle lifetime",
++                    Section = "Media info",
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "minutes",
++                    Min = 1,
++                    Max = 10_080,
++                    DefaultValue = MediaInfoProbeCache.IdleLifetimeMs / 60_000,
++                    EnvironmentVariable = "ARR_FFPROBE_CACHE_IDLE_MINUTES",
++                    Description = "A cached result that is not used for this long is dropped.",
++                    Warning = "Results are kept longer and use memory for longer.",
++                    WarnAbove = 1440,
++                    Constants = new[] { "MediaInfoProbeCache.IdleLifetimeMs" }
++                },
++                new OptimizeTunable
++                {
++                    Name = FfprobeCacheSettleSeconds,
++                    Label = "ffprobe settle time",
++                    Section = "Media info",
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "seconds",
++                    Min = 5,
++                    Max = 3600,
++                    DefaultValue = (long)MediaInfoProbeCache.SettleTime.TotalSeconds,
++                    EnvironmentVariable = "ARR_FFPROBE_CACHE_SETTLE_SECONDS",
++                    Description = "A file written less than this long before it was probed may still be changing within the time-stamp " +
++                                  "resolution of its file system: its result is reused only for the recently-written lifetime, and a failed " +
++                                  "probe of it is not remembered.",
++                    Warning = "With a short settle time, a file rewritten in place with the same size and time stamp could keep its old media info.",
++                    WarnBelow = 30,
++                    Constants = new[] { "MediaInfoProbeCache.SettleTime" }
++                },
++                new OptimizeTunable
++                {
++                    Name = FfprobeCacheUnsettledSeconds,
++                    Label = "ffprobe recently-written lifetime",
++                    Section = "Media info",
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "seconds",
++                    Min = 0,
++                    Max = 3600,
++                    DefaultValue = MediaInfoProbeCache.UnsettledLifetimeMs / 1000,
++                    EnvironmentVariable = "ARR_FFPROBE_CACHE_UNSETTLED_SECONDS",
++                    ZeroMeans = "results of recently written files are not cached",
++                    Description = "How long the result of a recently written file (see settle time) is reused: long enough for one import pass.",
++                    Warning = "A file that is still being written could be reused with media info from before its last change for this long.",
++                    WarnAbove = 300,
++                    Constants = new[] { "MediaInfoProbeCache.UnsettledLifetimeMs" }
++                },
++                new OptimizeTunable
++                {
++                    Name = FfprobeCacheSweepSeconds,
++                    Label = "ffprobe cache sweep interval",
++                    Section = "Media info",
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "seconds",
++                    Min = 1,
++                    Max = 3600,
++                    DefaultValue = MediaInfoProbeCache.SweepIntervalMs / 1000,
++                    EnvironmentVariable = "ARR_FFPROBE_CACHE_SWEEP_SECONDS",
++                    Description = "How often expired results are removed from the cache (checked when the cache is used).",
++                    Warning = "Very frequent sweeps cost CPU on every media info read.",
++                    WarnBelow = 10,
++                    Constants = new[] { "MediaInfoProbeCache.SweepIntervalMs" }
++                },
++                new OptimizeTunable
++                {
++                    Name = FfprobeCacheEvictionBatch,
++                    Label = "ffprobe cache eviction batch",
++                    Section = "Media info",
++                    Editable = false,
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "files",
++                    DefaultValue = (long)MediaInfoProbeCache.EvictionBatch,
++                    Description = "When the ffprobe cache is over a limit, the least recently used results are dropped until a tenth of the " +
++                                  "room is free again.",
++                    HowToChange = "Derived: one tenth of \"ffprobe cache entries\" (and of the memory limit). Change those to change it.",
++                    ReadOnlyValue = s => (long)(s.FfprobeCache.Capacity / 10),
++                    Constants = new[] { "MediaInfoProbeCache.EvictionBatch" }
++                },
++                new OptimizeTunable
++                {
++                    Name = IndexerBuiltInLimits,
++                    Label = "Indexer types with their own limit",
++                    Section = "Indexers",
++                    Editable = false,
++                    Kind = OptimizeValueKind.Text,
++                    DefaultValue = "PassThePopcorn: 4000 ms",
++                    Description = "These indexer types keep their own built-in request spacing; the indexer request spacing above does not change it.",
++                    HowToChange = "Fixed in upstream Radarr code (PassThePopcorn.RateLimit), not part of these patches. Changing it needs a rebuild.",
++                    ReadOnlyValue = s => "PassThePopcorn: 4000 ms"
++                },
++                new OptimizeTunable
++                {
++                    Name = ImportRetryInterval,
++                    Label = "Import retry after an error",
++                    Section = "Imports",
++                    Editable = false,
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "minutes",
++                    DefaultValue = 1L,
++                    Description = "A download whose automatic import throws an error goes back to \"import pending\" and is tried again at " +
++                                  "the next check for finished downloads. There is no back-off: a lasting error is retried at every check, " +
++                                  "quietly after the first warning.",
++                    HowToChange = "Follows Radarr's own \"check for finished downloads\" interval (CheckForFinishedDownloadInterval, " +
++                                  "PUT /api/v3/config/downloadclient). It is not a setting of these patches.",
++                    ReadOnlyValue = s => (long)s.CheckForFinishedDownloadInterval
++                },
++                new OptimizeTunable
++                {
++                    Name = ProviderSettingsTypeCache,
++                    Label = "Indexer settings type lookup",
++                    Section = "Indexers",
++                    Editable = false,
++                    Kind = OptimizeValueKind.Text,
++                    DefaultValue = "Always on",
++                    Description = "The settings type of each indexer, download client and list is looked up once per type name instead of " +
++                                  "scanning every type in Radarr.Core for every database row.",
++                    HowToChange = "No tunable value: the set of types never changes while the app runs, so the lookup is always exact. " +
++                                  "Fixed in this build (ProviderRepository).",
++                    ReadOnlyValue = s => "Always on"
++                }
++            };
++
++            var deferral = FindHousekeepingMaxDeferral();
++
++            if (deferral.HasValue)
++            {
++                list.Add(new OptimizeTunable
++                {
++                    Name = HousekeepingMaxDeferral,
++                    Label = "Housekeeping max deferral",
++                    Section = "Housekeeping",
++                    Editable = false,
++                    Kind = OptimizeValueKind.Integer,
++                    Unit = "minutes",
++                    DefaultValue = (long)deferral.Value.TotalMinutes,
++                    Description = "Housekeeping (with its database VACUUM) waits until no other command is running. On a busy instance it " +
++                                  "starts anyway after waiting this long.",
++                    HowToChange = "Fixed in this build (constant HousekeepingCommand.MaxDeferral). Changing it needs a rebuild.",
++                    ReadOnlyValue = s => (long)deferral.Value.TotalMinutes,
++                    Constants = new[] { "HousekeepingCommand.MaxDeferral" }
++                });
++            }
++
++            return list;
++        }
++
++        // The housekeeping max deferral comes from a separate patch; it is listed when that patch is in this build.
++        private static TimeSpan? FindHousekeepingMaxDeferral()
++        {
++            var type = typeof(OptimizeTunables).Assembly.GetType("NzbDrone.Core.Housekeeping.HousekeepingCommand");
++            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
++            var field = type?.GetField("MaxDeferral", flags);
++            var value = field != null ? field.GetValue(null) : type?.GetProperty("MaxDeferral", flags)?.GetValue(null);
++
++            return value is TimeSpan span ? span : null;
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs b/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
+index 1e25c5ef1..b47396ad5 100644
+--- a/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
++++ b/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
+@@ -2,6 +2,7 @@
+ using System.Linq;
+ using NLog;
+ using NzbDrone.Common.Extensions;
++using NzbDrone.Core.Optimize;
+ 
+ namespace NzbDrone.Core.Profiles.Releases
+ {
+@@ -34,6 +35,13 @@ public ReleaseProfileService(IReleaseProfileRepository repo, Logger logger)
+ 
+         public List<ReleaseProfile> All()
+         {
++            // Cache off (Optimize settings): read every time, as on stock. Every write still clears the cached list, so it
++            // is never out of date when the cache is turned on again.
++            if (!OptimizeSettings.Current.ReleaseProfileCache)
++            {
++                return _repo.All().ToList();
++            }
++
+             lock (_profilesLock)
+             {
+                 _profiles ??= _repo.All().ToList();
+diff --git a/src/Radarr.Api.V3/Config/OptimizeConfigController.cs b/src/Radarr.Api.V3/Config/OptimizeConfigController.cs
+new file mode 100644
+index 000000000..a0e29ff61
+--- /dev/null
++++ b/src/Radarr.Api.V3/Config/OptimizeConfigController.cs
+@@ -0,0 +1,63 @@
++using System.Collections.Generic;
++using Microsoft.AspNetCore.Http.HttpResults;
++using Microsoft.AspNetCore.Mvc;
++using NzbDrone.Core.Optimize;
++using Radarr.Http;
++using Radarr.Http.REST;
++using Radarr.Http.REST.Attributes;
++
++namespace Radarr.Api.V3.Config
++{
++    // GET/PUT /api/v3/config/optimize: the Optimize settings page. Values set by an environment variable are reported as
++    // locked and are ignored on PUT (not an error, so the page can send its whole resource back).
++    // GET /api/v3/config/optimize/settings: every tunable value of the optimization patches with its effective value,
++    // default, source and how to change it. GET /api/v3/config/optimize/status: the built-in optimizations and counters.
++    [V3ApiController("config/optimize")]
++    public class OptimizeConfigController : RestController<OptimizeConfigResource>
++    {
++        private readonly IOptimizeSettingsService _optimizeSettingsService;
++
++        public OptimizeConfigController(IOptimizeSettingsService optimizeSettingsService)
++        {
++            _optimizeSettingsService = optimizeSettingsService;
++
++            SharedValidator.Include(new OptimizeConfigResourceValidator(optimizeSettingsService));
++        }
++
++        protected override OptimizeConfigResource GetResourceById(int id)
++        {
++            return GetOptimizeConfig();
++        }
++
++        [HttpGet]
++        [Produces("application/json")]
++        public OptimizeConfigResource GetOptimizeConfig()
++        {
++            return OptimizeConfigResourceMapper.ToResource(_optimizeSettingsService.Current, _optimizeSettingsService.GetSettings());
++        }
++
++        [RestPutById]
++        [Consumes("application/json")]
++        [Produces("application/json")]
++        public Results<Accepted<OptimizeConfigResource>, NotFound> SaveOptimizeConfig([FromBody] OptimizeConfigResource resource)
++        {
++            _optimizeSettingsService.Save(resource.ToValues());
++
++            return Accepted(resource.Id);
++        }
++
++        [HttpGet("settings")]
++        [Produces("application/json")]
++        public List<OptimizeSettingInfo> GetOptimizeSettings()
++        {
++            return _optimizeSettingsService.GetSettings();
++        }
++
++        [HttpGet("status")]
++        [Produces("application/json")]
++        public OptimizeStatus GetOptimizeStatus()
++        {
++            return _optimizeSettingsService.GetStatus();
++        }
++    }
++}
+diff --git a/src/Radarr.Api.V3/Config/OptimizeConfigResource.cs b/src/Radarr.Api.V3/Config/OptimizeConfigResource.cs
+new file mode 100644
+index 000000000..888bed0c0
+--- /dev/null
++++ b/src/Radarr.Api.V3/Config/OptimizeConfigResource.cs
+@@ -0,0 +1,80 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Reflection;
++using NzbDrone.Core.Optimize;
++using Radarr.Http.REST;
++
++namespace Radarr.Api.V3.Config
++{
++    // Values of the Optimize settings page. GET returns null for a number or text that is not set anywhere (it follows
++    // the default). PUT changes only the values it carries: a missing or null value is left unchanged, like the stock
++    // config endpoints; sending the default value resets a value (its saved value is cleared, the source becomes
++    // "default"). Numbers are long so an out-of-range number gets the normal field error instead of a JSON error.
++    // Tunables carries, for every tunable value of the optimization patches (also the read-only ones), its effective
++    // value, default, bounds, source and whether an environment variable locks it; it is ignored on PUT, as are values
++    // whose environment variable is set.
++    public class OptimizeConfigResource : RestResource
++    {
++        public long? IndexerRateLimitMs { get; set; }
++        public string CacheHitHeader { get; set; }
++        public string CacheHitValue { get; set; }
++        public long? FfprobeTimeoutMinutes { get; set; }
++
++        public long? GrabSpacingMs { get; set; }
++        public long? CustomFormatCacheCapacity { get; set; }
++        public long? CustomFormatCacheExpiryMinutes { get; set; }
++        public long? CustomFormatCacheMaxInputChars { get; set; }
++        public bool? DecisionBatchMemo { get; set; }
++        public bool? ReleaseProfileCache { get; set; }
++        public long? FfprobeCacheEntries { get; set; }
++        public long? FfprobeCacheMaxMegabytes { get; set; }
++        public long? FfprobeCacheMaxEntryKilobytes { get; set; }
++        public long? FfprobeCacheFailureMinutes { get; set; }
++        public long? FfprobeCacheIdleMinutes { get; set; }
++        public long? FfprobeCacheSettleSeconds { get; set; }
++        public long? FfprobeCacheUnsettledSeconds { get; set; }
++        public long? FfprobeCacheSweepSeconds { get; set; }
++
++        public List<OptimizeSettingInfo> Tunables { get; set; }
++    }
++
++    public static class OptimizeConfigResourceMapper
++    {
++        private static readonly PropertyInfo[] ValueProperties = typeof(OptimizeConfigResource)
++            .GetProperties(BindingFlags.Instance | BindingFlags.Public)
++            .Where(p => OptimizeTunables.Get(p.Name) is { Editable: true })
++            .ToArray();
++
++        public static IEnumerable<string> ValuePropertyNames => ValueProperties.Select(p => p.Name);
++
++        public static OptimizeConfigResource ToResource(OptimizeSettings settings, List<OptimizeSettingInfo> tunables)
++        {
++            var resource = new OptimizeConfigResource { Id = 1, Tunables = tunables };
++
++            foreach (var property in ValueProperties)
++            {
++                var tunable = OptimizeTunables.Get(property.Name);
++                var effective = settings[tunable.Name];
++
++                var value = effective.Source == OptimizeValueSource.Default && tunable.Kind != OptimizeValueKind.Boolean
++                    ? null
++                    : effective.Value;
++
++                property.SetValue(resource, value);
++            }
++
++            return resource;
++        }
++
++        // Values by tunable name, for IOptimizeSettingsService.Save and Validate. Null values are left out: PUT leaves
++        // them unchanged.
++        public static Dictionary<string, object> ToValues(this OptimizeConfigResource resource)
++        {
++            return ValueProperties
++                .Select(p => (Name: OptimizeTunables.Get(p.Name).Name, Value: p.GetValue(resource)))
++                .Where(v => v.Value != null)
++                .ToDictionary(v => v.Name, v => v.Value, StringComparer.OrdinalIgnoreCase);
++        }
++    }
++}
+diff --git a/src/Radarr.Api.V3/Config/OptimizeConfigResourceValidator.cs b/src/Radarr.Api.V3/Config/OptimizeConfigResourceValidator.cs
+new file mode 100644
+index 000000000..345391373
+--- /dev/null
++++ b/src/Radarr.Api.V3/Config/OptimizeConfigResourceValidator.cs
+@@ -0,0 +1,24 @@
++using FluentValidation;
++using NzbDrone.Core.Optimize;
++
++namespace Radarr.Api.V3.Config
++{
++    // Bounds and formats of every editable value, from the same definitions the app uses for the environment variables.
++    // Values whose environment variable is set are not validated: PUT ignores them.
++    public class OptimizeConfigResourceValidator : AbstractValidator<OptimizeConfigResource>
++    {
++        public OptimizeConfigResourceValidator(IOptimizeSettingsService optimizeSettingsService)
++        {
++            RuleFor(r => r).Custom((resource, context) =>
++            {
++                foreach (var error in optimizeSettingsService.Validate(resource.ToValues()))
++                {
++                    var tunable = OptimizeTunables.Get(error.Key);
++                    var propertyName = char.ToUpperInvariant(tunable.Name[0]) + tunable.Name.Substring(1);
++
++                    context.AddFailure(propertyName, error.Value);
++                }
++            });
++        }
++    }
++}
+-- 
+2.53.0
+
