@@ -225,9 +225,9 @@ dotnet test src/NzbDrone.Core.Test/Radarr.Core.Test.csproj -c Release -p:EnableA
 The regression and equivalence fixtures for `0002`–`0010` are in `tests/UpstreamFixtures/<Group>/`;
 `tests/README.md` says how to copy and run them. Full-suite result for this release (filter
 `Category!=ManualTest&Category!=AutomationTest&Category!=IntegrationTest&Category!=WINDOWS&Category!=PerfNextBenchmark`):
-patched tree with every fixture added 4,677 passed, 26 skipped (one 2-second timing check of
-`0002`, run while image builds loaded the machine, was 0.03 s short and passed on three reruns of its
-fixture); stock `v7.0.3.10918` 4,173 passed, 26 skipped, 0 failed. `Radarr.Api.Test` with the
+patched tree with every fixture added 4,681 passed, 26 skipped, 0 failed (in an earlier run, made
+while image builds loaded the machine, one 2-second timing check of `0002` was 0.03 s short; it passed
+on three reruns of its fixture and in this run); stock `v7.0.3.10918` 4,173 passed, 26 skipped, 0 failed. `Radarr.Api.Test` with the
 Optimize controller fixture: 39 passed. `Radarr.Host.Test`: 23 passed, 5 skipped (including both
 container wiring fixtures). The test projects also build with upstream's `TreatWarningsAsErrors=true`.
 

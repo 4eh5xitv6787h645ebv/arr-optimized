@@ -223,7 +223,7 @@ the speed-ups, and the Optimize page's tests (including `NzbDrone.Api.Test` for 
 
 Full-suite result for this release (upstream filter `Category!=ManualTest&Category!=AutomationTest&
 Category!=IntegrationTest&Category!=WINDOWS`, plus `Category!=PerfNextBenchmark`): patched tree with
-every fixture added 6,117 passed, 28 skipped, 0 failed; stock `v5.0.0.3041` 5,725 passed, 27 skipped,
+every fixture added 6,118 passed, 28 skipped, 0 failed; stock `v5.0.0.3041` 5,725 passed, 27 skipped,
 0 failed. The extra skip is the PostgreSQL-only history test, which passes against PostgreSQL 16.
 `Sonarr.Api.Test` with the Optimize controller fixture: 47 passed. `Sonarr.Host.Test`: 24 passed,
 4 skipped (including both container wiring fixtures). The test projects also build with upstream's
