@@ -141,7 +141,7 @@ fails on stock and passes with the patch) and the equivalence tests for the spee
 
 Full-suite result for this release (upstream filter `Category!=ManualTest&Category!=AutomationTest&
 Category!=IntegrationTest&Category!=WINDOWS`, plus `Category!=PerfNextBenchmark`): patched tree with
-every fixture added 5,955 passed, 28 skipped, 0 failed; stock `v5.0.0.3041` 5,725 passed, 27 skipped,
+every fixture added 5,958 passed, 28 skipped, 0 failed; stock `v5.0.0.3041` 5,725 passed, 27 skipped,
 0 failed. The extra skip is the PostgreSQL-only history test, which passes against PostgreSQL 16.
 
 ## Benchmark and equivalence harness
@@ -153,11 +153,11 @@ search-cache database, which stay outside this repository.
   sizes, publish times and indexer ids, plus the verbatim cached pages with every URL replaced.
 - `offline_newznab.py`: Newznab endpoint serving that index. It never fetches anything.
 - `make_clone.py`: prepares an isolated config. Indexers point at the replay with dummy keys, other
-  indexers are disabled, scheduled tasks are parked, and it refuses to run if download clients,
-  notifications or import lists exist.
+  indexers are disabled, scheduled tasks are parked, and download clients, notifications and import
+  lists are deleted from the copy (the snapshot is never written).
 - `lab.py`: `up`/`down` (an `--internal` Docker network, no egress), `search` (full decision
-  output per query), `bench` (cold and warm search timing), `rss`, `rss-decisions`, `profile`
-  (dotnet-trace).
+  output per query), `bench` (cold and warm search timing), `rss`, `rss-decisions` (reads the
+  rotated debug logs oldest first), `profile` (dotnet-trace).
 - `compare.py`: field-by-field comparison of two `search` outputs.
 - `analyze_speedscope.py`: profile summary restricted to the decision code path.
 

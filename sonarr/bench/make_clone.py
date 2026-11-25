@@ -3,7 +3,9 @@
 
 * Newznab indexers point at the offline replay container; their API keys are
   replaced with a dummy value. Any other indexer implementation is disabled.
-* Refuses to continue if download clients, notifications or import lists exist.
+* Download clients, notifications and import lists (and their status rows) are
+  deleted from the copy; it still refuses to continue if any remain. The
+  snapshot itself is never written.
 * All scheduled tasks are pushed far into the future so nothing runs during
   timing except the requests the benchmark makes.
 """
@@ -20,6 +22,11 @@ out = Path(a.out)
 out.mkdir(parents=True, exist_ok=True)
 shutil.copyfile(a.db, out / "sonarr.db")
 con = sqlite3.connect(out / "sonarr.db")
+stripped = {}
+for table in ("DownloadClients", "DownloadClientStatus", "Notifications", "NotificationStatus", "ImportLists", "ImportListStatus"):
+    if con.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]:
+        # The clone must never reach a real download client, notification target or list.
+        stripped[table] = con.execute(f"DELETE FROM {table}").rowcount
 for table in ("DownloadClients", "Notifications", "ImportLists"):
     n = con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
     if n:
@@ -48,4 +55,4 @@ key = a.api_key or secrets.token_hex(16)
   <UpdateMechanism>Docker</UpdateMechanism><AnalyticsEnabled>False</AnalyticsEnabled>
 </Config>
 """)
-print(json.dumps({"config": str(out), "api_key_file": "config.xml"}))
+print(json.dumps({"config": str(out), "api_key_file": "config.xml", "stripped_rows": stripped}))

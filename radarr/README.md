@@ -133,7 +133,7 @@ dotnet test src/NzbDrone.Core.Test/Radarr.Core.Test.csproj -c Release -p:EnableA
 The regression and equivalence fixtures for `0002`–`0008` are in `tests/UpstreamFixtures/<Group>/`;
 `tests/README.md` says how to copy and run them. Full-suite result for this release (filter
 `Category!=ManualTest&Category!=AutomationTest&Category!=IntegrationTest&Category!=WINDOWS&Category!=PerfNextBenchmark`):
-patched tree with every fixture added 4,443 passed, 26 skipped, 0 failed; stock `v7.0.3.10918`
+patched tree with every fixture added 4,446 passed, 26 skipped, 0 failed; stock `v7.0.3.10918`
 4,173 passed, 26 skipped, 0 failed.
 
 ## Updating to a new upstream release

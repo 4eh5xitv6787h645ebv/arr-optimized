@@ -231,7 +231,11 @@ def main():
         result = rss_sync(a.name)
         time.sleep(2)
         lines = []
-        for log in sorted((cfg / "logs").glob("sonarr.debug*.txt"), reverse=True):
+        # Oldest first: NLog's rolling archives are sonarr.debug.<n>.txt with 0 the newest, then sonarr.debug.txt.
+        def age(log):
+            n = log.name[len("sonarr.debug."):-len(".txt")]
+            return -int(n) if n.isdigit() else 1
+        for log in sorted((cfg / "logs").glob("sonarr.debug*.txt"), key=age):
             for line in log.read_text(errors="replace").splitlines():
                 m = re.match(r"^\S+ \S+\|Debug\|DownloadDecisionMaker\|(Release '.*' from '.*' (?:accepted|rejected.*))$", line)
                 if m:

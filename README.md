@@ -156,16 +156,38 @@ from a cache so stock and patched builds see identical input:
 
 Small searches gain less wall time than CPU time, because both apps deliberately wait about 2 s
 between requests to the same indexer. That limit is unchanged unless you set
-`ARR_INDEXER_RATE_LIMIT_MS`.
+`ARR_INDEXER_RATE_LIMIT_MS` or `ARR_INDEXER_CACHE_HIT_HEADER`. With them, in the same lab (seven
+replayed indexers, medians of three runs):
+
+| | Stock | Patched, nothing set | Cache header, hit | Cache header, miss | `ARR_INDEXER_RATE_LIMIT_MS=200` |
+|---|---|---|---|---|---|
+| Sonarr, 40 episode searches in a row | 398 s | 398 s | 8.7 s | 398 s | 39.8 s |
+| Sonarr, one season search | 30.1 s | 20.3 s | 2.6 s | 20.6 s | 4.1 s |
+| Radarr, 27 interactive movie searches | 100.6 s | 88.9 s | 28.7 s | 88.0 s | 31.8 s |
+| Radarr, automatic search of 40 movies | 178.0 s | 170.2 s | 30.0 s | 170.4 s | 38.1 s |
+
+- With nothing set, and on cache misses, the waits are the same as stock; the remaining difference
+  is decision CPU time. RSS sync sends one request per indexer, so it never waits and does not change.
+- These are best cases. The lab cache answers in milliseconds, and in the hit column every response
+  is marked as a hit. A real cache hit still has network latency, and a miss waits for the indexer.
+- The lab has no download client, so grabs were not exercised there. Grab spacing is covered by
+  the unit tests, including several grabs from one host that start at the same time.
 
 Equivalence: every decision (accepted/rejected, rejection reasons, custom formats, score, order)
-was compared field by field with stock: Sonarr 13,702 decisions over 30 searches plus RSS, Radarr
-10,318 decisions over 27 searches plus RSS. All identical. The later patches don't change what the
-decision code computes (Radarr's in-memory release profiles are the same rows, reloaded after every
-change; upstream's decision-engine and custom-format tests pass unchanged).
+was compared field by field with stock, using the images built from this repository:
+
+- Sonarr: 30 searches (13,716 releases) and two RSS syncs (1,368 decisions), identical with
+  nothing set and with both variables set.
+- Radarr: 27 movie searches and RSS, two passes (10,526 decisions), identical with nothing set,
+  with the cache header, and with `ARR_INDEXER_RATE_LIMIT_MS=200`.
+
+The decision code does not read the new variables; they only change when indexer requests and
+grabs are sent. The other patches don't change what the decision code computes (Radarr's in-memory
+release profiles are the same rows, reloaded after every change; upstream's decision-engine and
+custom-format tests pass unchanged).
 
 Tests: upstream's full core test suites pass on the patched source with every fixture from this
-repository added (Sonarr 5,955 passed, 0 failed; Radarr 4,443 passed, 0 failed; stock: 5,725 and
+repository added (Sonarr 5,958 passed, 0 failed; Radarr 4,446 passed, 0 failed; stock: 5,725 and
 4,173 passed, 0 failed), as do the runners in `*/tests`. Each bug fix has a regression test that
 fails on stock and passes with the patch.
 

@@ -163,13 +163,16 @@ namespace NzbDrone.Core.Test.IndexerTests.RateLimitTests
 
         private Task Grab()
         {
-            var remote = new RemoteMovie
+            return Mocker.Resolve<DownloadService>().DownloadReport(GrabRelease(), 1);
+        }
+
+        private RemoteMovie GrabRelease()
+        {
+            return new RemoteMovie
             {
                 Movie = Builder<Movie>.CreateNew().Build(),
                 Release = new ReleaseInfo { Title = "Grab", DownloadUrl = _server.Url + "download/1", DownloadProtocol = DownloadProtocol.Torrent }
             };
-
-            return Mocker.Resolve<DownloadService>().DownloadReport(remote, 1);
         }
 
         private List<double> Gaps()
@@ -515,6 +518,30 @@ namespace NzbDrone.Core.Test.IndexerTests.RateLimitTests
             gaps.Should().HaveCount(2);
             gaps.Should().OnlyContain(g => g >= 1.9 && g < 3.0);
             GrabGaps()[0].Should().BeInRange(searchToGrab - 0.1, searchToGrab + 0.45);
+        }
+
+        // Regression (final review): grabs from one host that start at the same time on different threads, as when RSS
+        // sync and an interactive grab, or two searches, run at once. With a lowered limit the per-host grab gate takes
+        // them one at a time, so each grab still goes out at least 2 s after the previous one was released. Without
+        // the gate's lock, with 500 ms they went out 0.5 s apart.
+        [TestCase(null)]
+        [TestCase("500")]
+        [TestCase("0")]
+        public async Task concurrent_grabs_from_one_host_should_stay_two_seconds_apart(string rateLimit)
+        {
+            SetEnvironment(rateLimit, null, null);
+
+            var downloadService = Mocker.Resolve<DownloadService>();
+            var releases = Enumerable.Range(0, 3).Select(_ => GrabRelease()).ToList();
+
+            await Task.WhenAll(releases.Select(r => Task.Run(() => downloadService.DownloadReport(r, 1))));
+
+            var grabs = _grabSeconds.OrderBy(g => g).ToList();
+            var gaps = grabs.Zip(grabs.Skip(1), (x, y) => y - x).ToList();
+            TestContext.Progress.WriteLine("{0}: grabs at [{1}] s", TestContext.CurrentContext.Test.Name, string.Join(", ", grabs.Select(g => g.ToString("0.000"))));
+
+            gaps.Should().HaveCount(2);
+            gaps.Should().OnlyContain(g => g >= 1.9 && g < 3.0);
         }
 
         private List<double> GrabGaps()

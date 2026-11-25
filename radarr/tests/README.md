@@ -48,7 +48,7 @@ Each folder below mirrors upstream's `src/` folder, so it is copied over the bui
 
 | Folder | Patch | Fixtures |
 |---|---|---|
-| `RateLimit` | 0002 | `IndexerTests/RateLimitTests/*` (options parsing, the cache-hit refund under threads and a fixed clock, `HttpIndexerBase` and TorrentPotato wiring, real-HTTP timing of searches, grabs and redirects) and `NzbDrone.Host.Test/IndexerRateLimitContainerFixture.cs` (container wiring) |
+| `RateLimit` | 0002 | `IndexerTests/RateLimitTests/*` (options parsing, the cache-hit refund under threads and a fixed clock, `HttpIndexerBase` and TorrentPotato wiring, real-HTTP timing of searches, grabs (also several grabs from one host started at once) and redirects) and `NzbDrone.Host.Test/IndexerRateLimitContainerFixture.cs` (container wiring) |
 | `Perf` | 0003 | `PerfNext/*`: statistics equal stock's; the release-profile cache is cleared on every write and a load that overlaps a write never keeps old rows; the settings-type cache is used |
 | `FFprobe` | 0004 | `MediaFiles/MediaInfo/*` and the four small sample files in `Files/Media` (`make-media.sh` regenerates them). Uses the ffprobe upstream's test project already ships; the timeout tests also need `/bin/sh`, `mkfifo` and `/proc`. The symlink and timeout tests are skipped on Windows |
 | `Imports` | 0005 | `ImportFixes/*`: a throwing import is retried; a lost movie link is completed from import results or history |
