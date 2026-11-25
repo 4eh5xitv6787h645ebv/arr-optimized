@@ -244,13 +244,17 @@ was integrated (made while image builds loaded the machine: `IndexerRateLimitTim
 `concurrent_requests_should_keep_reserved_slot("HIT",0.0)` measured 1.87 s where 1.9–3.0 s was
 allowed; the fixture passed three reruns and every later full run); 4,681 passed, 26 skipped, 0
 failed in the repair and re-verification runs (two more fixtures); 4,691 passed, 26 skipped, 0
-failed on the final tree (the review fixes and their tests). Stock `v7.0.3.10918`: 4,173 passed, 26
-skipped, 0 failed. `Radarr.Api.Test` with the Optimize controller fixture: 39 passed, 42 on the final
-tree (the `PUT` reset tests). `Radarr.Host.Test`: 23 passed, 5 skipped (including both container
-wiring fixtures). The test projects also build with upstream's `TreatWarningsAsErrors=true`. In CI,
-the wall-clock timing fixtures (`IndexerRateLimitTimingFixture`, `GrabGateHostsFixture`,
-`OptimizeRateLimitLiveFixture`; 39 tests) run in their own step that is retried once and does not
-block publishing; every other fixture does.
+failed with the review fixes and their tests; 4,692 passed, 26 skipped, 0 failed on the final tree
+(one ffprobe timing test split in two), run as the two CI steps below. Stock `v7.0.3.10918`: 4,173
+passed, 26 skipped, 0 failed. `Radarr.Api.Test` with the Optimize controller fixture: 39 passed, 42
+on the final tree (the `PUT` reset tests). `Radarr.Host.Test`: 23 passed, 5 skipped (including both
+container wiring fixtures). The test projects also build with upstream's
+`TreatWarningsAsErrors=true`. In CI, the tests that assert a window or an upper bound on wall-clock
+time (`IndexerRateLimitTimingFixture`, `GrabGateHostsFixture`, `OptimizeRateLimitLiveFixture`,
+`OptimizeGrabSpacingTimingFixture` and
+`VideoFileInfoReaderTimeoutFixture.shared_timeout_should_stop_the_second_pass_before_it_ends`; 42
+tests, 4,650 + 42 on the final tree) run in their own step that is retried once and does not block
+publishing; every other test does.
 
 ## Updating to a new upstream release
 

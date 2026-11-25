@@ -26,7 +26,7 @@ Each folder below mirrors upstream's `src/` folder, so it is copied over the bui
 |---|---|---|
 | `RateLimit` | 0005 | `IndexerTests/RateLimitTests/*` (options parsing, the cache-hit refund under threads and a fixed clock, `HttpIndexerBase` wiring, real-HTTP timing of searches, grabs (also several grabs from one host started at once) and redirects) and `NzbDrone.Host.Test/IndexerRateLimitContainerFixture.cs` (container wiring) |
 | `Perf` | 0006 | `PerfNext/*`: the history total equals stock's for every filter and with orphaned rows; series statistics equal stock's; `HistoryPagedCountPostgresFixture` (PostgreSQL only) checks that a 300,000-row history page still loads on PostgreSQL |
-| `FFprobe` | 0007 | `MediaFiles/MediaInfo/*` and the four small sample files in `Files/Media` (`make-media.sh` regenerates them). Uses the ffprobe upstream's test project already ships; the timeout tests also need `/bin/sh`, `mkfifo` and `/proc`. The symlink and timeout tests are skipped on Windows |
+| `FFprobe` | 0007 | `MediaFiles/MediaInfo/*` and the four small sample files in `Files/Media` (`make-media.sh` regenerates them). Uses the ffprobe upstream's test project already ships; the timeout tests also need `/bin/sh`, `mkfifo` and `/proc`. The symlink and timeout tests are skipped on Windows. `shared_timeout_should_stop_the_second_pass_before_it_ends` asserts an upper bound on wall-clock time, so CI runs it in the non-blocking timing step |
 | `Imports` | 0008 | `ImportFixes/*`: a throwing import is retried, zero mapped episodes is not "imported" |
 | `Scheduler` | 0009 | `JobTests/SchedulerFixture.cs`; `SchedulerRestartMeasurement.cs` is `[Explicit]` (measurement only) |
 | `Extras` | 0010 | `Extras/Others/*`, `Housekeeping/*` |

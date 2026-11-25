@@ -319,7 +319,8 @@ full run of this release:
 | Stock (no patches, no fixtures) | 5,725 passed, 27 skipped, 0 failed | 4,173 passed, 26 skipped, 0 failed |
 | Integration of the Optimize page | 6,117 passed, 28 skipped, 0 failed | 4,676 passed, 26 skipped, **1 failed** |
 | Two more fixtures; repair run and re-verification run | 6,118 passed, 28 skipped, 0 failed (both) | 4,681 passed, 26 skipped, 0 failed (both) |
-| Final tree (this commit: review fixes and their tests) | 6,119 passed, 28 skipped, 0 failed | 4,691 passed, 26 skipped, 0 failed |
+| Review fixes and their tests | 6,119 passed, 28 skipped, 0 failed | 4,691 passed, 26 skipped, 0 failed |
+| Final tree (wall-clock tests split from the blocking ones; run as the two CI steps) | 6,078 + 42 = 6,120 passed, 28 skipped, 0 failed | 4,650 + 42 = 4,692 passed, 26 skipped, 0 failed |
 
 The one failure was a wall-clock timing check, `IndexerRateLimitTimingFixture`
 (`concurrent_requests_should_keep_reserved_slot("HIT",0.0)`), which measured 1.87 s where 1.9–3.0 s
@@ -335,18 +336,23 @@ bug fix has a regression test that fails on stock and passes with the patch.
 cd sonarr && ./build.sh --image      # or: cd radarr && ./build.sh
 ```
 
-`build.sh` clones the pinned upstream tag, refuses to build unless it resolves to the pinned
-commit, applies the patches, builds the core and API DLLs with the .NET SDK named in
-`upstream.env`, builds the web UI with upstream's own frontend scripts (Node.js 24 and yarn 1;
-`YARN="corepack yarn"` works too), and builds the image. The image replaces `*.Core.dll`,
-`*.Api.V3.dll` and the `bin/UI` folder of the pinned base image and nothing else. The GitHub
-Actions workflow does the same for every push to `main`. It first runs upstream's core, API and
-container tests with every fixture from this repository; any failure there stops publishing. The
-fixtures that check wall-clock timing over real HTTP or real delays (`IndexerRateLimitTimingFixture`,
-`GrabGateHostsFixture`, `OptimizeLiveApplyTimingFixture` in Sonarr, `OptimizeRateLimitLiveFixture`
-in Radarr) run in a separate step that is retried once and only warns, because a busy shared runner
-can miss their time windows. Then it publishes the images as `<version>`, `<version>-<short commit>`
-and `latest`.
+`build.sh` clones the pinned upstream tag, refuses to build unless it resolves to the pinned commit,
+applies the patches, builds the core and API DLLs with the .NET SDK named in `upstream.env`, builds
+the web UI with upstream's own frontend scripts (Node.js 24 and yarn 1; `YARN="corepack yarn"` works
+too), and builds the image. The image replaces `*.Core.dll`, `*.Api.V3.dll` and the `bin/UI` folder
+of the pinned base image and nothing else. The GitHub Actions workflow does the same for every push
+to `main`. It first runs upstream's core, API and container tests with every fixture from this
+repository; any failure there stops publishing. Only the tests that assert a window or an upper
+bound on wall-clock time over real HTTP, real delays or a real ffprobe run are kept out of that
+step: the fixtures `IndexerRateLimitTimingFixture` and `GrabGateHostsFixture`,
+`OptimizeLiveApplyTimingFixture` in Sonarr, `OptimizeRateLimitLiveFixture` and
+`OptimizeGrabSpacingTimingFixture` in Radarr, and the single test
+`VideoFileInfoReaderTimeoutFixture.shared_timeout_should_stop_the_second_pass_before_it_ends` in
+both (42 tests per app). They run in a separate step that is retried once and only warns, because a
+busy shared runner can miss their time bounds. Everything else blocks, including timeout tests that
+only check a lower bound (a timeout cannot fire early on a slow runner) and scheduler tests that
+wait up to 15 s. Then it publishes the images as `<version>`, `<version>-<short commit>` and
+`latest`.
 
 ## Updating to a new upstream release
 

@@ -32,11 +32,13 @@ jobs:
     env:
       # Upstream's own filter, plus the [Explicit] benchmark timings.
       BASE_FILTER: Category!=ManualTest&Category!=AutomationTest&Category!=IntegrationTest&Category!=WINDOWS&Category!=PerfNextBenchmark
-      # Fixtures that assert wall-clock windows over real HTTP or real delays (for example "the next request starts
-      # 1.9 to 3.0 s later"). A loaded shared runner can miss such a window without anything being wrong, so they run
-      # in their own step that is retried once and never blocks publishing. Every other fixture blocks.
-      TIMING_FIXTURES: FullyQualifiedName~IndexerRateLimitTimingFixture|FullyQualifiedName~OptimizeLiveApplyTimingFixture|FullyQualifiedName~OptimizeRateLimitLiveFixture|FullyQualifiedName~GrabGateHostsFixture
-      NOT_TIMING_FIXTURES: FullyQualifiedName!~IndexerRateLimitTimingFixture&FullyQualifiedName!~OptimizeLiveApplyTimingFixture&FullyQualifiedName!~OptimizeRateLimitLiveFixture&FullyQualifiedName!~GrabGateHostsFixture
+      # Tests that assert a window or an upper bound on wall-clock time over real HTTP, real delays or a real ffprobe
+      # run (for example "the next request starts 1.9 to 3.0 s later"): these fixtures, plus one ffprobe test by name.
+      # A loaded shared runner can miss such a bound without anything being wrong, so they run in their own step that
+      # is retried once and never blocks publishing. Every other test blocks, including timeout tests that only check
+      # a lower bound (a timeout cannot fire early on a slow runner) and scheduler tests that wait up to 15 s.
+      TIMING_FIXTURES: FullyQualifiedName~IndexerRateLimitTimingFixture|FullyQualifiedName~OptimizeLiveApplyTimingFixture|FullyQualifiedName~OptimizeRateLimitLiveFixture|FullyQualifiedName~GrabGateHostsFixture|FullyQualifiedName~OptimizeGrabSpacingTimingFixture|FullyQualifiedName~VideoFileInfoReaderTimeoutFixture.shared_timeout_should_stop_the_second_pass_before_it_ends
+      NOT_TIMING_FIXTURES: FullyQualifiedName!~IndexerRateLimitTimingFixture&FullyQualifiedName!~OptimizeLiveApplyTimingFixture&FullyQualifiedName!~OptimizeRateLimitLiveFixture&FullyQualifiedName!~GrabGateHostsFixture&FullyQualifiedName!~OptimizeGrabSpacingTimingFixture&FullyQualifiedName!~VideoFileInfoReaderTimeoutFixture.shared_timeout_should_stop_the_second_pass_before_it_ends
     steps:
       - uses: actions/checkout@v4
 
@@ -83,13 +85,13 @@ jobs:
           dotnet build src/NzbDrone.Host.Test/${{ matrix.name }}.Host.Test.csproj "${f[@]}"
           cp _output/net10.0/${{ matrix.name }}.Mono.dll _tests/net10.0/
 
-      - name: Core tests (upstream suite and every fixture above, except the wall-clock timing fixtures)
+      - name: Core tests (upstream suite and every fixture above, except the wall-clock timing tests)
         working-directory: ${{ env.TREE }}
         run: >
           dotnet test _tests/net10.0/${{ matrix.name }}.Core.Test.dll
           --filter "$BASE_FILTER&$NOT_TIMING_FIXTURES"
 
-      - name: Wall-clock timing fixtures (retried once, do not block publishing)
+      - name: Wall-clock timing tests (retried once, do not block publishing)
         working-directory: ${{ env.TREE }}
         continue-on-error: true
         run: |
@@ -97,7 +99,7 @@ jobs:
             if dotnet test _tests/net10.0/${{ matrix.name }}.Core.Test.dll --filter "$BASE_FILTER&($TIMING_FIXTURES)"; then
               exit 0
             fi
-            echo "::warning::Timing fixtures failed (attempt $attempt)"
+            echo "::warning::Timing tests failed (attempt $attempt)"
           done
           exit 1
 

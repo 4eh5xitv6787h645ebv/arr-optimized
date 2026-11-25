@@ -184,9 +184,26 @@ namespace NzbDrone.Core.Test.MediaFiles.MediaInfo
             ProbeShouldBeStopped(SamplePath("ffprobe_cache_hevc_pq.mp4"));
         }
 
-        // One budget for all ffprobe runs of a probe: two passes that each fit the timeout, but not together.
+        // One budget for all ffprobe runs of a probe: two passes that each fit the timeout, but not together. With a
+        // budget per pass both would finish and the probe would return a result.
         [Test]
         public void all_ffprobe_passes_should_share_one_timeout()
+        {
+            var delay = TestTimeout.TotalSeconds * 2 / 3;
+            UseFfprobeStub(delayWhen: "-probesize ", delaySeconds: delay);
+
+            var result = Subject.GetMediaInfo(SamplePath("ffprobe_cache_noaudio.mkv"));
+
+            result.Should().BeNull("the second pass would end after the shared budget");
+            LoggedErrors().Should().ContainSingle().Which.Should().Contain("did not finish within");
+            ExceptionVerification.ExpectedErrors(1);
+        }
+
+        // The same probe, timed: the second pass is stopped when the shared budget runs out, before it would end. This
+        // is an upper bound on wall-clock time, so CI runs it in the timing step that is retried once and does not
+        // block publishing. The test above checks the shared budget itself and blocks.
+        [Test]
+        public void shared_timeout_should_stop_the_second_pass_before_it_ends()
         {
             var delay = TestTimeout.TotalSeconds * 2 / 3;
             UseFfprobeStub(delayWhen: "-probesize ", delaySeconds: delay);
@@ -195,9 +212,8 @@ namespace NzbDrone.Core.Test.MediaFiles.MediaInfo
             var result = Subject.GetMediaInfo(SamplePath("ffprobe_cache_noaudio.mkv"));
             watch.Stop();
 
-            result.Should().BeNull("the second pass would end after the shared budget");
+            result.Should().BeNull();
             watch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(delay * 2) - TimeSpan.FromMilliseconds(200));
-            LoggedErrors().Should().ContainSingle().Which.Should().Contain("did not finish within");
             ExceptionVerification.ExpectedErrors(1);
         }
 

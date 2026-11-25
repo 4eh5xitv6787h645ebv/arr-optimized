@@ -238,14 +238,17 @@ Full-suite results for this release (upstream filter `Category!=ManualTest&Categ
 Category!=IntegrationTest&Category!=WINDOWS`, plus `Category!=PerfNextBenchmark`), patched tree with
 every fixture added: 6,117 passed, 28 skipped, 0 failed when the Optimize page was integrated; 6,118
 passed, 28 skipped, 0 failed in the repair and re-verification runs (two more fixtures); 6,119
-passed, 28 skipped, 0 failed on the final tree (the review fixes and their test). Stock
-`v5.0.0.3041`: 5,725 passed, 27 skipped, 0 failed. The extra skip is the PostgreSQL-only history
-test, which passes against PostgreSQL 16. `Sonarr.Api.Test` with the Optimize controller fixture: 47
-passed in every run. `Sonarr.Host.Test`: 24 passed, 4 skipped (including both container wiring
-fixtures). The test projects also build with upstream's `TreatWarningsAsErrors=true`. In CI, the
-wall-clock timing fixtures (`IndexerRateLimitTimingFixture`, `GrabGateHostsFixture`,
-`OptimizeLiveApplyTimingFixture`; 41 tests) run in their own step that is retried once and does not
-block publishing; every other fixture does.
+passed, 28 skipped, 0 failed with the review fixes and their test; 6,120 passed, 28 skipped, 0
+failed on the final tree (one ffprobe timing test split in two), run as the two CI steps below.
+Stock `v5.0.0.3041`: 5,725 passed, 27 skipped, 0 failed. The extra skip is the PostgreSQL-only
+history test, which passes against PostgreSQL 16. `Sonarr.Api.Test` with the Optimize controller
+fixture: 47 passed in every run. `Sonarr.Host.Test`: 24 passed, 4 skipped (including both container
+wiring fixtures). The test projects also build with upstream's `TreatWarningsAsErrors=true`. In CI,
+the tests that assert a window or an upper bound on wall-clock time
+(`IndexerRateLimitTimingFixture`, `GrabGateHostsFixture`, `OptimizeLiveApplyTimingFixture` and
+`VideoFileInfoReaderTimeoutFixture.shared_timeout_should_stop_the_second_pass_before_it_ends`; 42
+tests, 6,078 + 42 on the final tree) run in their own step that is retried once and does not block
+publishing; every other test does.
 
 ## Benchmark and equivalence harness
 
