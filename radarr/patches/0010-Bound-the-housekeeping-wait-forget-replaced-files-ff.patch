@@ -25,8 +25,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../MediaInfo/MediaInfoProbeCache.cs          | 60 ++++++++++++-
  .../MediaInfo/VideoFileInfoReader.cs          | 49 ++++++++++-
  .../Messaging/Commands/CommandQueue.cs        | 84 +++++++++++++++++--
+ .../Optimize/OptimizeSettingsService.cs       |  7 +-
  .../Releases/ReleaseProfileService.cs         | 62 ++++++++++----
- 5 files changed, 236 insertions(+), 28 deletions(-)
+ 6 files changed, 242 insertions(+), 29 deletions(-)
 
 diff --git a/src/NzbDrone.Core/Housekeeping/HousekeepingCommand.cs b/src/NzbDrone.Core/Housekeeping/HousekeepingCommand.cs
 index 937bf3794..2da4aea0f 100644
@@ -408,6 +409,31 @@ index 3dbe0c313..128c6d8e2 100644
 +        }
      }
  }
+diff --git a/src/NzbDrone.Core/Optimize/OptimizeSettingsService.cs b/src/NzbDrone.Core/Optimize/OptimizeSettingsService.cs
+index 45a43dec6..625741a9a 100644
+--- a/src/NzbDrone.Core/Optimize/OptimizeSettingsService.cs
++++ b/src/NzbDrone.Core/Optimize/OptimizeSettingsService.cs
+@@ -5,6 +5,7 @@
+ using NzbDrone.Core.Configuration;
+ using NzbDrone.Core.Configuration.Events;
+ using NzbDrone.Core.CustomFormats;
++using NzbDrone.Core.Housekeeping;
+ using NzbDrone.Core.Indexers;
+ using NzbDrone.Core.Lifecycle;
+ using NzbDrone.Core.MediaFiles.MediaInfo;
+@@ -170,7 +171,11 @@ public OptimizeStatus GetStatus()
+                     Feature("Lost movie link recovery", "A finished download whose movie link was lost is completed from its import results or history.", true, "On"),
+                     Feature("Scheduler timer per instance", "In-app restarts no longer stack scheduler timers.", true, "On"),
+                     Feature("Duplicate extra files", "Replacing an -orig metadata file leaves no duplicate row; a daily cleanup removes old duplicates.", true, "On"),
+-                    Feature("Exclusive housekeeping", "Housekeeping and its VACUUM start only when no other command runs.", true, "On"),
++                    Feature("Exclusive housekeeping",
++                        "Housekeeping and its VACUUM wait until no other command runs, for at most " +
++                        $"HousekeepingCommand.MaxDeferralMinutes ({HousekeepingCommand.MaxDeferralMinutes} minutes); after that they start " +
++                        "alongside the other commands, as on stock.",
++                        true, $"On, waits at most {HousekeepingCommand.MaxDeferralMinutes} minutes"),
+                     Feature("Safe database restore", "Only a Radarr database or config is accepted; the previous database is kept until start-up.", true, "On")
+                 },
+                 Counters = new List<OptimizeCounter>
 diff --git a/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs b/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs
 index b47396ad5..858ff1511 100644
 --- a/src/NzbDrone.Core/Profiles/Releases/ReleaseProfileService.cs

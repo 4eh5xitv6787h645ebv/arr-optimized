@@ -14,6 +14,7 @@ using Microsoft.AspNetCore.Routing;
 using Moq;
 using NLog;
 using NUnit.Framework;
+using NzbDrone.Common.Serializer;
 using NzbDrone.Core.Configuration;
 using NzbDrone.Core.Indexers;
 using NzbDrone.Core.MediaFiles.MediaInfo;
@@ -119,7 +120,7 @@ namespace NzbDrone.Api.Test.v3.Config
             again.IndexerRateLimitMs.Should().Be(400);
             again.DecisionBatchMemo.Should().BeFalse();
 
-            // Reset to default: the default value clears the saved value (null leaves a value unchanged).
+            // Reset to default: the default value clears the saved value (as does an explicit null).
             again.IndexerRateLimitMs = 2000;
             again.DecisionBatchMemo = true;
             again.FfprobeCacheEntries = 1000;
@@ -170,6 +171,79 @@ namespace NzbDrone.Api.Test.v3.Config
             saved.CacheHitHeader.Should().BeNull();
             saved.FfprobeTimeoutMinutes.Should().Be(30);
             saved.Tunables.Single(t => t.Name == OptimizeTunables.DecisionBatchMemo).Source.Should().Be("default");
+        }
+
+        // PUT changes only the values present in the JSON body (as the app reads it, the same as the Sonarr image): a
+        // value left out keeps its saved value, an explicit null resets it to the default.
+        [Test]
+        public void put_should_change_only_the_values_present_in_the_body()
+        {
+            Put(STJson.Deserialize<OptimizeConfigResource>("{\"id\":1,\"grabSpacingMs\":1000,\"cacheHitHeader\":\"X-Search-Cache\",\"decisionBatchMemo\":false}"));
+
+            var partial = STJson.Deserialize<OptimizeConfigResource>("{\"id\":1,\"ffprobeTimeoutMinutes\":30}");
+            partial.ToValues().Keys.Should().BeEquivalentTo(OptimizeTunables.FfprobeTimeoutMinutes);
+            Put(partial);
+
+            var reloaded = _controller.GetOptimizeConfig();
+            reloaded.FfprobeTimeoutMinutes.Should().Be(30);
+            reloaded.GrabSpacingMs.Should().Be(1000);
+            reloaded.CacheHitHeader.Should().Be("X-Search-Cache");
+            reloaded.DecisionBatchMemo.Should().BeFalse();
+
+            var reset = STJson.Deserialize<OptimizeConfigResource>("{\"id\":1,\"grabSpacingMs\":null,\"cacheHitHeader\":null,\"decisionBatchMemo\":null}");
+            reset.ToValues().Keys.Should().BeEquivalentTo(OptimizeTunables.GrabSpacingMs, OptimizeTunables.CacheHitHeader, OptimizeTunables.DecisionBatchMemo);
+            new OptimizeConfigResourceValidator(_service).TestValidate(reset).ShouldNotHaveAnyValidationErrors();
+            Put(reset);
+
+            reloaded = _controller.GetOptimizeConfig();
+            reloaded.GrabSpacingMs.Should().BeNull();
+            reloaded.CacheHitHeader.Should().BeNull();
+            reloaded.DecisionBatchMemo.Should().BeTrue();
+            reloaded.Tunables.Single(t => t.Name == OptimizeTunables.GrabSpacingMs).Source.Should().Be("default");
+            reloaded.Tunables.Single(t => t.Name == OptimizeTunables.DecisionBatchMemo).Source.Should().Be("default");
+            reloaded.FfprobeTimeoutMinutes.Should().Be(30);
+            IndexerRateLimitOptions.Current.GrabSpacing.Should().Be(TimeSpan.FromSeconds(2));
+            IndexerRateLimitOptions.Current.RefundsCacheHits.Should().BeFalse();
+            OptimizeSettings.Current.DecisionBatchMemo.Should().BeTrue();
+
+            // The full resource the page sends back (every value, as returned by GET) keeps what is saved.
+            var full = STJson.Deserialize<OptimizeConfigResource>(STJson.ToJson(reloaded));
+            full.ToValues().Keys.Should().Contain(OptimizeTunables.FfprobeTimeoutMinutes);
+            Put(full);
+            _controller.GetOptimizeConfig().FfprobeTimeoutMinutes.Should().Be(30);
+            _controller.GetOptimizeConfig().GrabSpacingMs.Should().BeNull();
+        }
+
+        // Locked values are ignored on PUT, also an explicit null: the environment value stays and nothing is saved.
+        [Test]
+        public void put_null_should_not_touch_a_locked_value()
+        {
+            try
+            {
+                Environment.SetEnvironmentVariable(IndexerRateLimitOptions.RateLimitVariable, "300");
+                ResetEnvironment();
+                _service.Reload();
+
+                Put(STJson.Deserialize<OptimizeConfigResource>("{\"id\":1,\"indexerRateLimitMs\":null,\"grabSpacingMs\":2500}"));
+
+                var resource = _controller.GetOptimizeConfig();
+                resource.IndexerRateLimitMs.Should().Be(300);
+                resource.GrabSpacingMs.Should().Be(2500);
+                resource.Tunables.Single(t => t.Name == OptimizeTunables.IndexerRateLimitMs).Locked.Should().BeTrue();
+                _store.ContainsKey(OptimizeTunables.Get(OptimizeTunables.IndexerRateLimitMs).ConfigKey).Should().BeFalse();
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable(IndexerRateLimitOptions.RateLimitVariable, null);
+                ResetEnvironment();
+                _service.Reload();
+            }
+        }
+
+        // The environment is read once per process; the test hook that reads it again is internal to Radarr.Core.
+        private static void ResetEnvironment()
+        {
+            typeof(OptimizeSettings).GetMethod("ResetEnvironment", BindingFlags.NonPublic | BindingFlags.Static).Invoke(null, null);
         }
 
         // The controller wires the validator into the request pipeline: an invalid PUT is a 400 with field errors
@@ -235,6 +309,34 @@ namespace NzbDrone.Api.Test.v3.Config
             result.ShouldHaveValidationErrorFor("FfprobeCacheSettleSeconds");
             result.ShouldHaveValidationErrorFor("CustomFormatCacheCapacity");
             result.Errors.Should().HaveCount(5);
+        }
+
+        // The ffprobe cache strictness limits have the Sonarr image's bounds.
+        [Test]
+        public void validator_should_use_the_sonarr_ffprobe_cache_bounds()
+        {
+            var validator = new OptimizeConfigResourceValidator(_service);
+            var resource = _controller.GetOptimizeConfig();
+
+            resource.FfprobeCacheSettleSeconds = 59;
+            resource.FfprobeCacheUnsettledSeconds = 61;
+            resource.FfprobeCacheFailureMinutes = 11;
+
+            var result = validator.TestValidate(resource);
+            result.ShouldHaveValidationErrorFor("FfprobeCacheSettleSeconds");
+            result.ShouldHaveValidationErrorFor("FfprobeCacheUnsettledSeconds");
+            result.ShouldHaveValidationErrorFor("FfprobeCacheFailureMinutes");
+            result.Errors.Should().HaveCount(3);
+
+            resource.FfprobeCacheSettleSeconds = 60;
+            resource.FfprobeCacheUnsettledSeconds = 60;
+            resource.FfprobeCacheFailureMinutes = 10;
+            validator.TestValidate(resource).ShouldNotHaveAnyValidationErrors();
+
+            resource.FfprobeCacheSettleSeconds = 3600;
+            resource.FfprobeCacheUnsettledSeconds = 0;
+            resource.FfprobeCacheFailureMinutes = 0;
+            validator.TestValidate(resource).ShouldNotHaveAnyValidationErrors();
         }
 
         [Test]

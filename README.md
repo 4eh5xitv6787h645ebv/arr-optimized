@@ -25,7 +25,10 @@ source plus the patches in this repository. Every other assembly and everything 
 | `ghcr.io/4eh5xitv6787h645ebv/sonarr-optimized:5.0.0.3041` | Sonarr v5 (develop) `5.0.0.3041` | `lscr.io/linuxserver/sonarr:5.0.0.3041-ls212` |
 | `ghcr.io/4eh5xitv6787h645ebv/radarr-optimized:7.0.3.10918` | Radarr `7.0.3.10918` | `lscr.io/linuxserver/radarr:7.0.3.10918-ls328` |
 
-`latest` points at the newest build of each. Both images are `linux/amd64` and `linux/arm64`.
+`<version>` and `latest` point at the newest build of each. Every build is also published under an
+immutable per-commit tag, `<version>-<short commit>` (for example `5.0.0.3041-1a2b3c4`, the first
+seven characters of this repository's commit), which is never overwritten. Both images are
+`linux/amd64` and `linux/arm64`.
 
 ## Using it
 
@@ -44,6 +47,17 @@ services:
 version migrates its database, and it cannot be downgraded afterwards without that backup. In
 particular, Radarr 6 → 7 is a one-way database upgrade. The Sonarr image is the v5 (develop) line,
 so it suits setups that already run Sonarr v5 or want to.
+
+A later build of the same upstream version replaces `:<version>` and `:latest` on your next pull.
+To stay on one build, use its per-commit tag (the package page on GitHub lists them):
+
+```yaml
+    image: ghcr.io/4eh5xitv6787h645ebv/sonarr-optimized:5.0.0.3041-1a2b3c4   # one build, never replaced
+```
+
+To roll back to an earlier build of the same version, switch to that build's per-commit tag. Values
+saved on the Optimize page stay in the database; a build that does not know a value ignores it and
+uses its own default.
 
 To go back to stock, switch to the linuxserver image of the **same version**. The database format
 is identical, since the patches don't touch it. Values saved on the Optimize page are ordinary rows
@@ -137,9 +151,9 @@ works in light and dark mode and at phone width.
 - **Advanced tuning:** grab spacing, the custom-format cache, the per-search read memo, the ffprobe
   result cache (size, memory and lifetimes) and, on Radarr, the release-profile cache. Each field
   shows its default and allowed range, warns in its risky range and has a Reset button.
-- **All optimization settings:** every value, including the fixed ones, with the value in effect,
-  the default, where it comes from (default, saved on this page, or environment variable) and how
-  to change it.
+- **All optimization settings:** every value, including the read-only ones, with the value in
+  effect, the default, where it comes from (default, saved on this page, environment variable,
+  fixed in this build, or a stock setting of the app) and how to change it.
 - **Status:** which built-in optimizations are on, and counters since start-up (cache hits and
   misses, ffprobe probes and timeouts, requests that waited or were refunded).
 
@@ -147,33 +161,57 @@ How values are chosen, for each value on its own: a valid **environment variable
 field is shown read-only; otherwise the value **saved on the page**; otherwise the **default**. An
 invalid environment variable is ignored with one warning in the log and shown as an error under its
 field. A saved value applies **as soon as you press Save**, without a restart, and is kept across
-restarts. With every default, requests, grabs and probes behave as on stock, and every cache uses the
-limits listed above.
+restarts. With every default, indexer requests and grabs are timed exactly as on stock, and release
+decisions are the same as on stock. ffprobe runs are not exactly as on stock: by default all
+ffprobe runs for one file share a 15-minute time limit (stock has no limit; 0 turns it off), the
+result of an unchanged file is reused from the ffprobe cache, and a failed probe of a file that has
+not been written for a minute is not repeated for 10 minutes (see [Bug fixes](#bug-fixes)).
 
-| Setting | Environment variable | Default | Page range |
+Both apps have the same page, the same environment variable names and the same bounds, so one
+`.env` can serve both containers. Two rows exist in one app only, because the code they tune
+exists only there.
+
+| Setting | Environment variable | Default | Allowed |
 |---|---|---|---|
-| Indexer request spacing | `ARR_INDEXER_RATE_LIMIT_MS` | 2000 ms (stock) | 0–10000 ms (variable: 0–86400000) |
-| Cache hit header | `ARR_INDEXER_CACHE_HIT_HEADER` | empty = off | header name |
-| Cache hit value | `ARR_INDEXER_CACHE_HIT_VALUE` | `HIT` | |
-| ffprobe time limit | `ARR_FFPROBE_TIMEOUT_MINUTES` | 15 min | 0–1440 (0 = no limit, stock) |
+| Indexer request spacing | `ARR_INDEXER_RATE_LIMIT_MS` | 2000 ms (stock) | page 0–10000 ms, variable 0–86400000 ms |
+| Cache hit header | `ARR_INDEXER_CACHE_HIT_HEADER` | empty = off (stock) | an HTTP header name, up to 256 characters |
+| Cache hit value | `ARR_INDEXER_CACHE_HIT_VALUE` | `HIT` | one value without `,` or `;`, up to 256 characters |
+| ffprobe time limit | `ARR_FFPROBE_TIMEOUT_MINUTES` | 15 min (stock: none) | 0–1440 (0 = no limit, as stock) |
 | Grab spacing | `ARR_GRAB_SPACING_MS` | 2000 ms (stock) | 0–60000 ms |
 | Custom-format cache entries | `ARR_CF_CACHE_CAPACITY` | 50000 | 0–1000000 (0 = off) |
 | Custom-format cache lifetime | `ARR_CF_CACHE_LIFETIME_MINUTES` | 360 min | 1–10080 |
-| Custom-format cache input limit | `ARR_CF_CACHE_MAX_KEY_CHARS` | 4096 | 256–65536 |
-| Per-search read memo | `ARR_DECISION_MEMO_ENABLED` | on | on/off |
+| Custom-format cache input limit | `ARR_CF_CACHE_MAX_KEY_CHARS` | 4096 characters | 256–65536 |
+| Custom-format cache sweep (Sonarr only) | `ARR_CF_CACHE_SWEEP_SECONDS` | 60 s | 1–3600 |
+| Per-search read memo | `ARR_DECISION_MEMO_ENABLED` | on | on/off (also true/false, yes/no, 1/0) |
+| Release-profile cache (Radarr only) | `ARR_RELEASE_PROFILE_CACHE` | on | on/off |
 | ffprobe cache entries | `ARR_FFPROBE_CACHE_CAPACITY` | 1000 | 0–100000 (0 = off) |
 | ffprobe cache memory | `ARR_FFPROBE_CACHE_MAX_MB` | 32 MB | 0–1024 (0 = off) |
+| ffprobe largest result | `ARR_FFPROBE_CACHE_MAX_ENTRY_KB` | 4096 KB | 1–131072, never more than the cache memory |
+| ffprobe idle lifetime | `ARR_FFPROBE_CACHE_IDLE_MINUTES` | 360 min | 1–10080 |
+| ffprobe failure lifetime | `ARR_FFPROBE_CACHE_FAILURE_MINUTES` | 10 min | 0–10 (0 = not remembered) |
+| ffprobe settle time | `ARR_FFPROBE_CACHE_SETTLE_SECONDS` | 60 s | 60–3600 |
+| ffprobe recently-written lifetime | `ARR_FFPROBE_CACHE_UNSETTLED_SECONDS` | 60 s | 0–60 (0 = not reused) |
+| ffprobe cache sweep | `ARR_FFPROBE_CACHE_SWEEP_SECONDS` | 60 s | 1–3600 |
 
-Each app's README has the full list, including the ffprobe cache lifetimes, Sonarr's
-custom-format cache sweep and Radarr's release-profile cache:
+The ffprobe failure lifetime, settle time and recently-written lifetime can only be made stricter
+than their defaults: the cache recognises a file by its size and modification time, and a file
+written less than a minute ago can still change without either changing. An environment variable
+outside its range is ignored with a warning (the page or the default applies), in both apps. Turning
+a cache off (0 or off) runs the stock code path for it. Each app's README describes every row:
 [sonarr/README.md](sonarr/README.md#settings--optimize-patch-0011),
-[radarr/README.md](radarr/README.md#settings--optimize-patch-0009). Turning a cache off (0 or
-off) runs the stock code path for it.
+[radarr/README.md](radarr/README.md#settings--optimize-patch-0009).
 
-The page uses `GET`/`PUT /api/v3/config/optimize` (plus `/settings` and `/status`), with the same
-API key as every other endpoint. A `PUT` changes only the values it carries; fields set by an
-environment variable are ignored. To reset a value: Sonarr takes `null`, Radarr takes the default
-value (the page does this for you). Invalid values give HTTP 400 with one error per field.
+The page uses `GET`/`PUT /api/v3/config/optimize` (plus `GET .../settings`, every value with its
+source, and `GET .../status`), with the same API key as every other endpoint. The API is the same in
+both apps:
+
+- `GET` returns each value that is saved or set by an environment variable; a number or text that
+  follows its default is left out of the JSON (`null`). On/off values are always returned.
+- `PUT` changes only the values present in the body. A value left out keeps its saved value; an
+  explicit `null` resets it to the default. The page's Reset button sends `null` (for an on/off
+  value, its default, which also resets it).
+- Values set by an environment variable are locked: `PUT` ignores them, also a `null`.
+- Invalid values give HTTP 400 with one error per field.
 
 ### Optional: shorter wait between indexer requests (off by default)
 
@@ -218,9 +256,12 @@ Details, rebase notes and the per-patch risk are in [sonarr/README.md](sonarr/RE
 ## Results
 
 Measured in an offline lab against a copy of a real library, with indexer responses replayed
-from a cache so stock and patched builds see identical input. These runs used the previous build of
-this series, before the Optimize page; with its defaults the page's values are the same constants,
-and no decision code changed since.
+from a cache so stock and patched builds see identical input. The timings below were measured on the
+previous build of this series (next3), before the Optimize page. The Optimize page patches changed
+decision-path cache code so that it reads its limits live and can be turned off (the custom-format
+cache in both apps, Sonarr's per-batch read memo, Radarr's indexer memo and release-profile cache);
+with the defaults the limits are the same constants as in next3. The timings were not measured
+again; the decision equivalence was (below).
 
 | | Stock | Patched |
 |---|---|---|
@@ -251,10 +292,15 @@ page). With them, in the same lab (seven replayed indexers, medians of three run
 Equivalence: every decision (accepted/rejected, rejection reasons, custom formats, score, order)
 was compared field by field with stock, using the images built from this repository:
 
-- Sonarr: 30 searches (13,716 releases) and two RSS syncs (1,368 decisions), identical with
-  nothing set and with both variables set.
-- Radarr: 27 movie searches and RSS, two passes (10,526 decisions), identical with nothing set,
-  with the cache header, and with `ARR_INDEXER_RATE_LIMIT_MS=200`.
+- Sonarr, next3: 30 searches (13,716 releases) and two RSS syncs (1,368 decisions), identical with
+  nothing set and with both variables set. Current series (next4, with the Optimize page), nothing
+  set: the same 30 searches (13,716 releases) and both RSS feeds (1,368 decisions), identical.
+- Radarr, next3: 27 movie searches and RSS, two passes (10,526 decisions), identical with nothing
+  set, with the cache header, and with `ARR_INDEXER_RATE_LIMIT_MS=200`. Current series (next4),
+  nothing set: 27 movie searches and RSS, two passes (56 comparisons, 10,678 decisions), identical.
+
+The next4 runs used the images built before the last review fixes (the Radarr ffprobe cache bounds,
+the `PUT` reset semantics, and texts and labels on the page); those fixes change no decision code.
 
 The decision code does not read the rate-limit settings; they only change when indexer requests and
 grabs are sent. The other patches don't change what the decision code computes (Radarr's in-memory
@@ -264,11 +310,24 @@ cached and for how long: the tests compare custom-format matches with the stock 
 smallest, default and largest values and while the values change, and a cache that is turned off
 runs the stock code path.
 
-Tests: upstream's full core test suites pass on the patched source with every fixture from this
-repository added (Sonarr 6,117 passed, 28 skipped, 0 failed; Radarr 4,677 passed, 26 skipped;
-stock: 5,725 and 4,173 passed, 0 failed), as do upstream's API tests with the Optimize controller
-fixtures (Sonarr 47, Radarr 39 passed), the container wiring fixtures and the runners in `*/tests`.
-Each bug fix has a regression test that fails on stock and passes with the patch.
+Tests: upstream's full core test suite runs on the patched source with every fixture from this
+repository added (filter as in CI: upstream's categories plus the `[Explicit]` benchmarks). Every
+full run of this release:
+
+| Run | Sonarr core | Radarr core |
+|---|---|---|
+| Stock (no patches, no fixtures) | 5,725 passed, 27 skipped, 0 failed | 4,173 passed, 26 skipped, 0 failed |
+| Integration of the Optimize page | 6,117 passed, 28 skipped, 0 failed | 4,676 passed, 26 skipped, **1 failed** |
+| Two more fixtures; repair run and re-verification run | 6,118 passed, 28 skipped, 0 failed (both) | 4,681 passed, 26 skipped, 0 failed (both) |
+| Final tree (this commit: review fixes and their tests) | 6,119 passed, 28 skipped, 0 failed | 4,691 passed, 26 skipped, 0 failed |
+
+The one failure was a wall-clock timing check, `IndexerRateLimitTimingFixture`
+(`concurrent_requests_should_keep_reserved_slot("HIT",0.0)`), which measured 1.87 s where 1.9–3.0 s
+was allowed while image builds loaded the machine; its fixture passed three reruns and every later
+full run. Upstream's API tests with the Optimize controller fixtures: Sonarr 47 passed, Radarr 42
+passed (39 before the `PUT` reset tests). Container wiring (`*.Host.Test`): Sonarr 24 passed and 4
+skipped, Radarr 23 passed and 5 skipped. The runners in `*/tests` pass against the final DLLs. Each
+bug fix has a regression test that fails on stock and passes with the patch.
 
 ## Building it yourself
 
@@ -281,8 +340,13 @@ commit, applies the patches, builds the core and API DLLs with the .NET SDK name
 `upstream.env`, builds the web UI with upstream's own frontend scripts (Node.js 24 and yarn 1;
 `YARN="corepack yarn"` works too), and builds the image. The image replaces `*.Core.dll`,
 `*.Api.V3.dll` and the `bin/UI` folder of the pinned base image and nothing else. The GitHub
-Actions workflow does the same for every push to `main`, first runs upstream's core, API and
-container tests with every fixture from this repository, and publishes the images.
+Actions workflow does the same for every push to `main`. It first runs upstream's core, API and
+container tests with every fixture from this repository; any failure there stops publishing. The
+fixtures that check wall-clock timing over real HTTP or real delays (`IndexerRateLimitTimingFixture`,
+`GrabGateHostsFixture`, `OptimizeLiveApplyTimingFixture` in Sonarr, `OptimizeRateLimitLiveFixture`
+in Radarr) run in a separate step that is retried once and only warns, because a busy shared runner
+can miss their time windows. Then it publishes the images as `<version>`, `<version>-<short commit>`
+and `latest`.
 
 ## Updating to a new upstream release
 

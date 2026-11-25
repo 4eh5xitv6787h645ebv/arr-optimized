@@ -72,10 +72,10 @@ namespace NzbDrone.Core.Test.OptimizeTests
             [Values(1, 1000, 100_000)] long entries,
             [Values(1, 32, 1024)] long megabytes,
             [Values(1, 4096, 131_072)] long entryKilobytes,
-            [Values(0, 10, 1440)] long failureMinutes,
+            [Values(0, 5, 10)] long failureMinutes,
             [Values(1, 360, 10_080)] long idleMinutes,
-            [Values(5, 60, 3600)] long settleSeconds,
-            [Values(0, 60, 3600)] long unsettledSeconds,
+            [Values(60, 600, 3600)] long settleSeconds,
+            [Values(0, 30, 60)] long unsettledSeconds,
             [Values(1, 60, 3600)] long sweepSeconds)
         {
             Use((OptimizeTunables.FfprobeCacheEntries, entries),

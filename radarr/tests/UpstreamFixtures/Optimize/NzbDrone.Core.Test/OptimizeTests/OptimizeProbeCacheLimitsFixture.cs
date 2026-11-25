@@ -67,8 +67,8 @@ namespace NzbDrone.Core.Test.OptimizeTests
 
         // A probe that started less than the settle time after the last write is "recently written": with a
         // recently-written lifetime of 0 it is not stored. One that started at or after the settle time is stored.
-        [TestCase(5)]
         [TestCase(60)]
+        [TestCase(61)]
         [TestCase(300)]
         [TestCase(3600)]
         public void settle_time_should_follow_the_setting(long settleSeconds)
@@ -86,8 +86,8 @@ namespace NzbDrone.Core.Test.OptimizeTests
         }
 
         [TestCase(10)]
+        [TestCase(30)]
         [TestCase(60)]
-        [TestCase(300)]
         public void recently_written_result_should_be_reused_for_the_unsettled_lifetime(long unsettledSeconds)
         {
             Use((OptimizeTunables.FfprobeCacheUnsettledSeconds, unsettledSeconds));
@@ -101,6 +101,84 @@ namespace NzbDrone.Core.Test.OptimizeTests
 
             Advance(2000);
             cache.TryGet("/movies/new", Stamp, out _).Should().BeFalse();
+        }
+
+        // The settle time, recently-written lifetime and failure lifetime have the Sonarr image's bounds, on the page, in
+        // the API validation and for the shared ARR_FFPROBE_CACHE_* environment variables: they only allow values at
+        // least as strict as the tested defaults (settle 60..3600 s, recently written 0..60 s, failure 0..10 min).
+        [TestCase(OptimizeTunables.FfprobeCacheSettleSeconds, "ARR_FFPROBE_CACHE_SETTLE_SECONDS", 60, 3600)]
+        [TestCase(OptimizeTunables.FfprobeCacheUnsettledSeconds, "ARR_FFPROBE_CACHE_UNSETTLED_SECONDS", 0, 60)]
+        [TestCase(OptimizeTunables.FfprobeCacheFailureMinutes, "ARR_FFPROBE_CACHE_FAILURE_MINUTES", 0, 10)]
+        public void strictness_limits_should_have_the_sonarr_bounds(string name, string variable, long min, long max)
+        {
+            var tunable = OptimizeTunables.Get(name);
+
+            tunable.EnvironmentVariable.Should().Be(variable);
+            tunable.Min.Should().Be(min);
+            tunable.Max.Should().Be(max);
+            tunable.EnvironmentMin.Should().BeNull();
+            tunable.EnvironmentMax.Should().BeNull();
+            ((long)tunable.DefaultValue).Should().BeInRange(min, max);
+
+            foreach (var fromEnvironment in new[] { false, true })
+            {
+                tunable.TryParse(min.ToString(), fromEnvironment, out _).Should().BeNull();
+                tunable.TryParse(max.ToString(), fromEnvironment, out _).Should().BeNull();
+                tunable.TryParse((max + 1).ToString(), fromEnvironment, out _).Should().Contain($"from {min} to {max}");
+
+                if (min > 0)
+                {
+                    tunable.TryParse((min - 1).ToString(), fromEnvironment, out _).Should().Contain($"from {min} to {max}");
+                }
+            }
+        }
+
+        // One .env shared by both containers: values the Sonarr image rejects are rejected here too (ignored with a
+        // warning, not locked), and the defaults stay in effect.
+        [Test]
+        public void out_of_range_environment_values_should_be_ignored_like_in_the_sonarr_image()
+        {
+            var variables = new Dictionary<string, string>
+            {
+                ["ARR_FFPROBE_CACHE_SETTLE_SECONDS"] = "10",
+                ["ARR_FFPROBE_CACHE_UNSETTLED_SECONDS"] = "3600",
+                ["ARR_FFPROBE_CACHE_FAILURE_MINUTES"] = "1440"
+            };
+
+            var environment = OptimizeEnvironment.Read(n => variables.TryGetValue(n, out var v) ? v : null, TestLogger);
+            var settings = OptimizeSettings.Build(environment, _ => null, 1);
+
+            foreach (var name in new[] { OptimizeTunables.FfprobeCacheSettleSeconds, OptimizeTunables.FfprobeCacheUnsettledSeconds, OptimizeTunables.FfprobeCacheFailureMinutes })
+            {
+                settings.IsLocked(name).Should().BeFalse(name);
+                settings[name].Source.Should().Be(OptimizeValueSource.Default, name);
+                settings[name].EnvironmentError.Should().NotBeNullOrWhiteSpace(name);
+            }
+
+            settings.FfprobeCache.SettleTime.Should().Be(MediaInfoProbeCache.SettleTime);
+            settings.FfprobeCache.UnsettledLifetimeMs.Should().Be(MediaInfoProbeCache.UnsettledLifetimeMs);
+            settings.FfprobeCache.FailureLifetimeMs.Should().Be(MediaInfoProbeCache.FailureLifetimeMs);
+            NzbDrone.Test.Common.ExceptionVerification.ExpectedWarns(3);
+        }
+
+        // A value saved before the bounds were aligned (for example a 10 s settle time) is ignored like any other
+        // invalid saved value: the default applies.
+        [Test]
+        public void saved_values_outside_the_bounds_should_fall_back_to_the_default()
+        {
+            var saved = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [OptimizeTunables.Get(OptimizeTunables.FfprobeCacheSettleSeconds).ConfigKey] = "10",
+                [OptimizeTunables.Get(OptimizeTunables.FfprobeCacheUnsettledSeconds).ConfigKey] = "300",
+                [OptimizeTunables.Get(OptimizeTunables.FfprobeCacheFailureMinutes).ConfigKey] = "60"
+            };
+
+            var settings = OptimizeSettings.Build(OptimizeEnvironment.Empty, k => saved.TryGetValue(k, out var v) ? v : null, 1);
+
+            settings.FfprobeCache.SettleTime.Should().Be(MediaInfoProbeCache.SettleTime);
+            settings.FfprobeCache.UnsettledLifetimeMs.Should().Be(MediaInfoProbeCache.UnsettledLifetimeMs);
+            settings.FfprobeCache.FailureLifetimeMs.Should().Be(MediaInfoProbeCache.FailureLifetimeMs);
+            settings[OptimizeTunables.FfprobeCacheSettleSeconds].Source.Should().Be(OptimizeValueSource.Default);
         }
 
         // The idle check of a lookup uses the setting in effect, without a sweep or ApplyLimits in between.

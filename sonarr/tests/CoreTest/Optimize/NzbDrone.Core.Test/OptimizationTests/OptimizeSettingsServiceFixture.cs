@@ -295,6 +295,46 @@ namespace NzbDrone.Core.Test.OptimizationTests
             Mocker.Resolve<Newznab>().RateLimit.Should().Be(TimeSpan.FromSeconds(2));
         }
 
+        // A cleared cache hit header is logged as "off", not as an empty value.
+        [Test]
+        public void clearing_the_cache_hit_header_should_log_off()
+        {
+            Subject.Refresh();
+
+            var messages = CaptureLog(() =>
+            {
+                Subject.Save(new Dictionary<string, object> { { "CacheHitHeader", "X-Cache" } });
+                Subject.Save(new Dictionary<string, object> { { "CacheHitHeader", null } });
+            });
+
+            messages.Should().Contain("Optimize: Cache hit header = X-Cache (saved on the Optimize page, default off)");
+            messages.Should().Contain("Optimize: Cache hit header = off (default)");
+            messages.Should().NotContain(m => m.Contains(" =  ") || m.Contains("default empty"));
+        }
+
+        private static List<string> CaptureLog(Action action)
+        {
+            var target = new NLog.Targets.MemoryTarget { Name = "OptimizeSettingsServiceFixture", Layout = "${message}" };
+            var rule = new NLog.Config.LoggingRule("*", NLog.LogLevel.Info, target);
+
+            NLog.LogManager.Configuration.AddTarget(target);
+            NLog.LogManager.Configuration.LoggingRules.Add(rule);
+            NLog.LogManager.ReconfigExistingLoggers();
+
+            try
+            {
+                action();
+            }
+            finally
+            {
+                NLog.LogManager.Configuration.LoggingRules.Remove(rule);
+                NLog.LogManager.Configuration.RemoveTarget(target.Name);
+                NLog.LogManager.ReconfigExistingLoggers();
+            }
+
+            return target.Logs.ToList();
+        }
+
         [Test]
         public void save_should_reject_invalid_values()
         {

@@ -49,10 +49,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../OptimizeSettingDefinitions.cs             | 337 ++++++++++
  .../Optimization/OptimizeSettingInfo.cs       |  86 +++
  .../Optimization/OptimizeSettings.cs          | 283 +++++++++
- .../Optimization/OptimizeSettingsService.cs   | 393 ++++++++++++
+ .../Optimization/OptimizeSettingsService.cs   | 400 ++++++++++++
  .../Config/OptimizeConfigController.cs        |  62 ++
  .../Config/OptimizeConfigResource.cs          | 189 ++++++
- 22 files changed, 2877 insertions(+), 187 deletions(-)
+ 22 files changed, 2884 insertions(+), 187 deletions(-)
  create mode 100644 frontend/src/Settings/Optimize/OptimizeSettings.module.css
  create mode 100644 frontend/src/Settings/Optimize/OptimizeSettings.tsx
  create mode 100644 frontend/src/Settings/Optimize/useOptimizeSettings.ts
@@ -3056,10 +3056,10 @@ index 0000000000..995d7a79e8
 +}
 diff --git a/src/NzbDrone.Core/Optimization/OptimizeSettingsService.cs b/src/NzbDrone.Core/Optimization/OptimizeSettingsService.cs
 new file mode 100644
-index 0000000000..ae98f8ed15
+index 0000000000..557008ef53
 --- /dev/null
 +++ b/src/NzbDrone.Core/Optimization/OptimizeSettingsService.cs
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,400 @@
 +using System;
 +using System.Collections.Generic;
 +using System.Diagnostics;
@@ -3422,6 +3422,14 @@ index 0000000000..ae98f8ed15
 +            return (OptimizeSettingDefinition.Format(value) ?? string.Empty).Trim();
 +        }
 +
++        // An empty text value turns its feature off (the cache hit header), so the log says "off" instead of nothing.
++        internal static string LogText(OptimizeSettingDefinition definition, object value)
++        {
++            var text = OptimizeSettingDefinition.Format(value);
++
++            return definition.Type == OptimizeValueType.Text && string.IsNullOrEmpty(text) ? "off" : text;
++        }
++
 +        // The first time every value that is not the default, then every change.
 +        private void LogChanges(OptimizeSettings previous, OptimizeSettings settings, bool first)
 +        {
@@ -3445,10 +3453,9 @@ index 0000000000..ae98f8ed15
 +                    _ => "default"
 +                };
 +
-+                var defaultText = string.IsNullOrEmpty(definition.DefaultText) ? "empty" : definition.DefaultText;
-+                var origin = now.Source == OptimizeSettingSource.Default ? source : $"{source}, default {defaultText}";
++                var origin = now.Source == OptimizeSettingSource.Default ? source : $"{source}, default {LogText(definition, definition.DefaultValue)}";
 +
-+                _logger.Info("Optimize: {0} = {1}{2} ({3})", definition.Label, OptimizeSettingDefinition.Format(now.Value), definition.Unit == null ? string.Empty : " " + definition.Unit, origin);
++                _logger.Info("Optimize: {0} = {1}{2} ({3})", definition.Label, LogText(definition, now.Value), definition.Unit == null ? string.Empty : " " + definition.Unit, origin);
 +            }
 +        }
 +    }

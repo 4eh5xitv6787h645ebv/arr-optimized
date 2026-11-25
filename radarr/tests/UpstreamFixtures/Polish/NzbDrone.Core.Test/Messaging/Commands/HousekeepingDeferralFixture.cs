@@ -97,10 +97,10 @@ namespace NzbDrone.Core.Test.Messaging.Commands
             var minutes = typeof(HousekeepingCommand).GetField("MaxDeferralMinutes", BindingFlags.Public | BindingFlags.Static);
             var span = typeof(HousekeepingCommand).GetField("MaxDeferral", BindingFlags.Public | BindingFlags.Static);
 
-            minutes.Should().NotBeNull("the page lists HousekeepingCommand.MaxDeferralMinutes");
+            minutes.Should().NotBeNull("the Optimize status names HousekeepingCommand.MaxDeferralMinutes");
             minutes.IsLiteral.Should().BeTrue();
             minutes.GetValue(null).Should().Be(30);
-            span.Should().NotBeNull();
+            span.Should().NotBeNull("the Optimize page reads HousekeepingCommand.MaxDeferral");
             span.GetValue(null).Should().Be(Deferral);
         }
 

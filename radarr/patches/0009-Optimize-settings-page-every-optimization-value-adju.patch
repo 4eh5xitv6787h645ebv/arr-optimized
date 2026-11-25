@@ -41,14 +41,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../Settings/Optimize/OptimizeSettings.css    | 207 +++++++
  .../Optimize/OptimizeSettings.css.d.ts        |  38 ++
  .../Settings/Optimize/OptimizeSettings.tsx    | 233 ++++++++
- .../Optimize/OptimizeSettingsList.tsx         | 138 +++++
+ .../Optimize/OptimizeSettingsList.tsx         | 140 +++++
  .../Optimize/OptimizeStatusSection.tsx        |  94 ++++
  .../Settings/Optimize/formatOptimizeValue.ts  |  69 +++
  frontend/src/Settings/Settings.tsx            |   9 +
  .../src/Store/Actions/Settings/optimize.js    |  64 +++
  frontend/src/Store/Actions/settingsActions.js |   5 +
  .../src/Store/Selectors/selectSettings.ts     |  26 +
- .../src/typings/Settings/OptimizeSettings.ts  |  80 +++
+ .../src/typings/Settings/OptimizeSettings.ts  |  81 +++
  .../Configuration/ConfigService.cs            |  53 ++
  .../Configuration/IConfigService.cs           |   9 +
  .../CustomFormats/CustomFormatMatchCache.cs   |  99 +++-
@@ -59,14 +59,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../MediaInfo/VideoFileInfoReader.cs          |  53 +-
  .../Optimize/OptimizeCounters.cs              |  44 ++
  .../Optimize/OptimizeSettings.cs              | 368 +++++++++++++
- .../Optimize/OptimizeSettingsService.cs       | 412 ++++++++++++++
- src/NzbDrone.Core/Optimize/OptimizeTunable.cs | 179 ++++++
- .../Optimize/OptimizeTunables.cs              | 510 ++++++++++++++++++
+ .../Optimize/OptimizeSettingsService.cs       | 421 ++++++++++++++
+ src/NzbDrone.Core/Optimize/OptimizeTunable.cs | 185 +++++++
+ .../Optimize/OptimizeTunables.cs              | 520 ++++++++++++++++++
  .../Releases/ReleaseProfileService.cs         |   8 +
- .../Config/OptimizeConfigController.cs        |  63 +++
- .../Config/OptimizeConfigResource.cs          |  80 +++
+ .../Config/OptimizeConfigController.cs        |  64 +++
+ .../Config/OptimizeConfigResource.cs          | 201 +++++++
  .../Config/OptimizeConfigResourceValidator.cs |  24 +
- 32 files changed, 3163 insertions(+), 75 deletions(-)
+ 32 files changed, 3313 insertions(+), 75 deletions(-)
  create mode 100644 frontend/src/Settings/Optimize/OptimizeField.tsx
  create mode 100644 frontend/src/Settings/Optimize/OptimizeSettings.css
  create mode 100644 frontend/src/Settings/Optimize/OptimizeSettings.css.d.ts
@@ -619,7 +619,7 @@ index 000000000..f26284e6e
 +export default cssExports;
 diff --git a/frontend/src/Settings/Optimize/OptimizeSettings.tsx b/frontend/src/Settings/Optimize/OptimizeSettings.tsx
 new file mode 100644
-index 000000000..8a759ed9f
+index 000000000..3adb4d1f0
 --- /dev/null
 +++ b/frontend/src/Settings/Optimize/OptimizeSettings.tsx
 @@ -0,0 +1,233 @@
@@ -738,8 +738,8 @@ index 000000000..8a759ed9f
 +  );
 +
 +  const handleSavePress = useCallback(() => {
-+    // The API leaves a missing or empty value unchanged (like the other config endpoints), so a field that was
-+    // cleared or reset on this page is sent as its default value, which clears the saved value.
++    // PUT changes only the values in the body; an explicit null resets a value to its default (as in the Sonarr
++    // image). A field that was cleared or reset on this page is sent as null.
 +    const payload: Record<string, OptimizeValue> = {};
 +
 +    Object.keys(pendingChanges ?? {}).forEach((name) => {
@@ -747,7 +747,7 @@ index 000000000..8a759ed9f
 +      const tunable = tunables.find((t) => t.name === name);
 +
 +      if (tunable && (value == null || value === '')) {
-+        payload[name] = tunable.defaultValue;
++        payload[name] = null;
 +      }
 +    });
 +
@@ -858,10 +858,10 @@ index 000000000..8a759ed9f
 +export default OptimizeSettings;
 diff --git a/frontend/src/Settings/Optimize/OptimizeSettingsList.tsx b/frontend/src/Settings/Optimize/OptimizeSettingsList.tsx
 new file mode 100644
-index 000000000..eb121260f
+index 000000000..68a30e726
 --- /dev/null
 +++ b/frontend/src/Settings/Optimize/OptimizeSettingsList.tsx
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,140 @@
 +import classNames from 'classnames';
 +import React from 'react';
 +import { OptimizeSettingInfo } from 'typings/Settings/OptimizeSettings';
@@ -890,7 +890,9 @@ index 000000000..eb121260f
 +
 +function getSource(tunable: OptimizeSettingInfo) {
 +  if (!tunable.editable) {
-+    return 'Fixed in this build';
++    // "Fixed in this build", or "Stock setting" for a value that follows a
++    // setting of the stock app (its how-to-change text says where).
++    return tunable.sourceText;
 +  }
 +
 +  if (tunable.locked) {
@@ -1348,17 +1350,18 @@ index e9a47cdce..e7841d39e 100644
        if (failure.isWarning) {
 diff --git a/frontend/src/typings/Settings/OptimizeSettings.ts b/frontend/src/typings/Settings/OptimizeSettings.ts
 new file mode 100644
-index 000000000..d139dfcbc
+index 000000000..a5ab25226
 --- /dev/null
 +++ b/frontend/src/typings/Settings/OptimizeSettings.ts
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,81 @@
 +export type OptimizeValue = number | string | boolean | null;
 +
 +export type OptimizeValueSource =
 +  | 'default'
 +  | 'database'
 +  | 'environment'
-+  | 'fixed';
++  | 'fixed'
++  | 'stock';
 +
 +export interface OptimizeSettingInfo {
 +  name: string;
@@ -2614,10 +2617,10 @@ index 000000000..2987f7ae8
 +}
 diff --git a/src/NzbDrone.Core/Optimize/OptimizeSettingsService.cs b/src/NzbDrone.Core/Optimize/OptimizeSettingsService.cs
 new file mode 100644
-index 000000000..133bf3b68
+index 000000000..45a43dec6
 --- /dev/null
 +++ b/src/NzbDrone.Core/Optimize/OptimizeSettingsService.cs
-@@ -0,0 +1,412 @@
+@@ -0,0 +1,421 @@
 +using System;
 +using System.Collections.Generic;
 +using System.Linq;
@@ -2643,9 +2646,9 @@ index 000000000..133bf3b68
 +        Dictionary<string, string> Validate(IDictionary<string, object> values);
 +
 +        // Saves values by tunable name and applies them at once. Locked (environment) and read-only tunables are
-+        // ignored, as are tunables not in the dictionary. Null, or the default value, clears the saved value (the
-+        // source becomes "default"). The API leaves null values out (null = unchanged there, like the stock config
-+        // endpoints), so through the API the default value is what resets a value.
++        // ignored, as are tunables not in the dictionary (PUT: a property left out of the body is unchanged). Null, or
++        // the default value, clears the saved value (the source becomes "default"); through the API an explicit null
++        // resets a value, as in the Sonarr image.
 +        OptimizeSettings Save(IDictionary<string, object> values);
 +
 +        List<OptimizeSettingInfo> GetSettings();
@@ -2863,10 +2866,18 @@ index 000000000..133bf3b68
 +                    var source = settings[tunable.Name].Source;
 +                    var unit = tunable.Unit == null ? string.Empty : " " + tunable.Unit;
 +
-+                    _logger.Info("{0} is now {1}{2}, {3}", tunable.Label, tunable.Format(after), unit,
-+                        source == OptimizeValueSource.Default ? "the default" : $"{SourceText(tunable, source)} (default {tunable.Format(tunable.DefaultValue)}{unit})");
++                    _logger.Info("{0} is now {1}{2}, {3}", tunable.Label, LogText(tunable, after), unit,
++                        source == OptimizeValueSource.Default ? "the default" : $"{SourceText(tunable, source)} (default {LogText(tunable, tunable.DefaultValue)}{unit})");
 +                }
 +            }
++        }
++
++        // An empty text value turns its feature off (the cache hit header), so the log says "off" instead of nothing.
++        internal static string LogText(OptimizeTunable tunable, object value)
++        {
++            var text = tunable.Format(value);
++
++            return tunable.Kind == OptimizeValueKind.Text && string.IsNullOrEmpty(text) ? "off" : text;
 +        }
 +
 +        private static OptimizeFeature Feature(string name, string description, bool active, string state)
@@ -2886,6 +2897,7 @@ index 000000000..133bf3b68
 +                OptimizeValueSource.Environment => $"environment variable {tunable.EnvironmentVariable}",
 +                OptimizeValueSource.Database => "saved on this page",
 +                OptimizeValueSource.Fixed => "fixed in this build",
++                OptimizeValueSource.Stock => "stock setting",
 +                _ => "default"
 +            };
 +        }
@@ -2920,8 +2932,8 @@ index 000000000..133bf3b68
 +
 +            if (!tunable.Editable)
 +            {
-+                info.Source = OptimizeValueSource.Fixed.ToString().ToLowerInvariant();
-+                info.SourceText = "Fixed in this build";
++                info.Source = tunable.ReadOnlySource.ToString().ToLowerInvariant();
++                info.SourceText = tunable.ReadOnlySource == OptimizeValueSource.Stock ? "Stock setting" : "Fixed in this build";
 +                info.HowToChange = tunable.HowToChange;
 +                info.Risky = false;
 +
@@ -3032,10 +3044,10 @@ index 000000000..133bf3b68
 +}
 diff --git a/src/NzbDrone.Core/Optimize/OptimizeTunable.cs b/src/NzbDrone.Core/Optimize/OptimizeTunable.cs
 new file mode 100644
-index 000000000..b99351c6e
+index 000000000..e17e9d773
 --- /dev/null
 +++ b/src/NzbDrone.Core/Optimize/OptimizeTunable.cs
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,185 @@
 +using System;
 +using System.Globalization;
 +
@@ -3060,7 +3072,10 @@ index 000000000..b99351c6e
 +        Environment,
 +
 +        // Cannot be changed while the app runs (fixed in this build, or derived from another setting).
-+        Fixed
++        Fixed,
++
++        // Read-only here because it follows a stock setting of the app, which is changed where the stock app changes it.
++        Stock
 +    }
 +
 +    // One tunable value of the optimization patches: its bounds, default, environment variable, and the text the
@@ -3110,6 +3125,9 @@ index 000000000..b99351c6e
 +
 +        // For read-only rows: the value in effect, computed at runtime.
 +        public Func<OptimizeSettings, object> ReadOnlyValue { get; init; }
++
++        // For read-only rows: where the value comes from (fixed in this build, or a stock setting of the app).
++        public OptimizeValueSource ReadOnlySource { get; init; } = OptimizeValueSource.Fixed;
 +
 +        public string ConfigKey => "Optimize" + char.ToUpperInvariant(Name[0]) + Name.Substring(1);
 +
@@ -3217,10 +3235,10 @@ index 000000000..b99351c6e
 +}
 diff --git a/src/NzbDrone.Core/Optimize/OptimizeTunables.cs b/src/NzbDrone.Core/Optimize/OptimizeTunables.cs
 new file mode 100644
-index 000000000..3338f5799
+index 000000000..640551f78
 --- /dev/null
 +++ b/src/NzbDrone.Core/Optimize/OptimizeTunables.cs
-@@ -0,0 +1,510 @@
+@@ -0,0 +1,520 @@
 +using System;
 +using System.Collections.Generic;
 +using System.Linq;
@@ -3396,7 +3414,7 @@ index 000000000..3338f5799
 +                                  "file gets no media info: an import of that file is rejected as \"Unable to determine if file is a sample\" and is " +
 +                                  "tried again on a later check of the download (about once a minute), and a rescan leaves the file without media info " +
 +                                  "until the next rescan. While the file does not change, the failed probe is remembered for the ffprobe failure " +
-+                                  "lifetime (10 minutes by default), so it is probed again only after that. 0 = no timeout (stock).",
++                                  "lifetime (10 minutes by default, and at most), so it is probed again only after that. 0 = no timeout (stock).",
 +                    Warning = "A short timeout can stop probes of large files on slow or network storage, and those files are then not imported " +
 +                              "until a later probe finishes in time.",
 +                    WarnBelow = 5,
@@ -3559,14 +3577,17 @@ index 000000000..3338f5799
 +                    Kind = OptimizeValueKind.Integer,
 +                    Unit = "minutes",
 +                    Min = 0,
-+                    Max = 1440,
++
++                    // Only shorter than the tested default (as in the Sonarr image): a longer value would keep a file without
++                    // media info (its import rejected as "Unable to determine if file is a sample") long after a brief failure.
++                    Max = MediaInfoProbeCache.FailureLifetimeMs / 60_000,
 +                    DefaultValue = MediaInfoProbeCache.FailureLifetimeMs / 60_000,
 +                    EnvironmentVariable = "ARR_FFPROBE_CACHE_FAILURE_MINUTES",
 +                    ZeroMeans = "failed probes are not remembered: the file is probed again every time, as on stock",
 +                    Description = "How long a failed probe (including one stopped by the ffprobe timeout) of an unchanged file is remembered, " +
-+                                  "so the file is not probed again before then. Only for files whose newest write is older than the settle time.",
-+                    Warning = "A file that ffprobe can read again (for example after a network mount comes back) stays without media info longer.",
-+                    WarnAbove = 60,
++                                  "so the file is not probed again before then. Only for files whose newest write is older than the settle time. " +
++                                  "It can only be shortened: a longer value would keep a file without media info, and its import rejected, long " +
++                                  "after a brief failure.",
 +                    Constants = new[] { "MediaInfoProbeCache.FailureLifetimeMs" }
 +                },
 +                new OptimizeTunable
@@ -3592,15 +3613,18 @@ index 000000000..3338f5799
 +                    Section = "Media info",
 +                    Kind = OptimizeValueKind.Integer,
 +                    Unit = "seconds",
-+                    Min = 5,
++
++                    // Only longer than the tested default (as in the Sonarr image): the cache matches on the file stamp alone,
++                    // so a file written less than a minute ago may still change under an unchanged stamp (coarse timestamps,
++                    // network share attribute caches, preallocated files).
++                    Min = (long)MediaInfoProbeCache.SettleTime.TotalSeconds,
 +                    Max = 3600,
 +                    DefaultValue = (long)MediaInfoProbeCache.SettleTime.TotalSeconds,
 +                    EnvironmentVariable = "ARR_FFPROBE_CACHE_SETTLE_SECONDS",
-+                    Description = "A file written less than this long before it was probed may still be changing within the time-stamp " +
-+                                  "resolution of its file system: its result is reused only for the recently-written lifetime, and a failed " +
-+                                  "probe of it is not remembered.",
-+                    Warning = "With a short settle time, a file rewritten in place with the same size and time stamp could keep its old media info.",
-+                    WarnBelow = 30,
++                    Description = "A file written less than this long before it was probed may still be changing without its size or " +
++                                  "modification time changing (coarse timestamps, network share attribute caches, preallocated files): its " +
++                                  "result is reused only for the recently-written lifetime, and a failed probe of it is not remembered. It can " +
++                                  "only be raised: a shorter time could reuse the result of a file that was still being written.",
 +                    Constants = new[] { "MediaInfoProbeCache.SettleTime" }
 +                },
 +                new OptimizeTunable
@@ -3611,13 +3635,15 @@ index 000000000..3338f5799
 +                    Kind = OptimizeValueKind.Integer,
 +                    Unit = "seconds",
 +                    Min = 0,
-+                    Max = 3600,
++
++                    // Only shorter than the tested default, for the same reason as the settle time.
++                    Max = MediaInfoProbeCache.UnsettledLifetimeMs / 1000,
 +                    DefaultValue = MediaInfoProbeCache.UnsettledLifetimeMs / 1000,
 +                    EnvironmentVariable = "ARR_FFPROBE_CACHE_UNSETTLED_SECONDS",
 +                    ZeroMeans = "results of recently written files are not cached",
-+                    Description = "How long the result of a recently written file (see settle time) is reused: long enough for one import pass.",
-+                    Warning = "A file that is still being written could be reused with media info from before its last change for this long.",
-+                    WarnAbove = 300,
++                    Description = "How long the result of a recently written file (see settle time) is reused: long enough for one import pass. " +
++                                  "It can only be shortened: such a file may still be changing, so a longer reuse could hand out the result of " +
++                                  "an older version of it.",
 +                    Constants = new[] { "MediaInfoProbeCache.UnsettledLifetimeMs" }
 +                },
 +                new OptimizeTunable
@@ -3675,8 +3701,10 @@ index 000000000..3338f5799
 +                    Description = "A download whose automatic import throws an error goes back to \"import pending\" and is tried again at " +
 +                                  "the next check for finished downloads. There is no back-off: a lasting error is retried at every check, " +
 +                                  "quietly after the first warning.",
-+                    HowToChange = "Follows Radarr's own \"check for finished downloads\" interval (CheckForFinishedDownloadInterval, " +
-+                                  "PUT /api/v3/config/downloadclient). It is not a setting of these patches.",
++                    ReadOnlySource = OptimizeValueSource.Stock,
++                    HowToChange = "Follows Radarr's own stock setting \"Check For Finished Downloads Interval\": change it under Settings > " +
++                                  "Download Clients > Completed Download Handling (shown with Show Advanced), or as " +
++                                  "checkForFinishedDownloadInterval with PUT /api/v3/config/downloadclient. It is not a setting of these patches.",
 +                    ReadOnlyValue = s => (long)s.CheckForFinishedDownloadInterval
 +                },
 +                new OptimizeTunable
@@ -3759,10 +3787,10 @@ index 1e25c5ef1..b47396ad5 100644
                  _profiles ??= _repo.All().ToList();
 diff --git a/src/Radarr.Api.V3/Config/OptimizeConfigController.cs b/src/Radarr.Api.V3/Config/OptimizeConfigController.cs
 new file mode 100644
-index 000000000..a0e29ff61
+index 000000000..72cccf2fe
 --- /dev/null
 +++ b/src/Radarr.Api.V3/Config/OptimizeConfigController.cs
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,64 @@
 +using System.Collections.Generic;
 +using Microsoft.AspNetCore.Http.HttpResults;
 +using Microsoft.AspNetCore.Mvc;
@@ -3773,7 +3801,8 @@ index 000000000..a0e29ff61
 +
 +namespace Radarr.Api.V3.Config
 +{
-+    // GET/PUT /api/v3/config/optimize: the Optimize settings page. Values set by an environment variable are reported as
++    // GET/PUT /api/v3/config/optimize: the Optimize settings page. PUT changes only the values present in the body (left
++    // out = unchanged, explicit null = reset to the default). Values set by an environment variable are reported as
 +    // locked and are ignored on PUT (not an error, so the page can send its whole resource back).
 +    // GET /api/v3/config/optimize/settings: every tunable value of the optimization patches with its effective value,
 +    // default, source and how to change it. GET /api/v3/config/optimize/status: the built-in optimizations and counters.
@@ -3828,49 +3857,171 @@ index 000000000..a0e29ff61
 +}
 diff --git a/src/Radarr.Api.V3/Config/OptimizeConfigResource.cs b/src/Radarr.Api.V3/Config/OptimizeConfigResource.cs
 new file mode 100644
-index 000000000..888bed0c0
+index 000000000..d8973d7bd
 --- /dev/null
 +++ b/src/Radarr.Api.V3/Config/OptimizeConfigResource.cs
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,201 @@
 +using System;
 +using System.Collections.Generic;
 +using System.Linq;
 +using System.Reflection;
++using System.Runtime.CompilerServices;
 +using NzbDrone.Core.Optimize;
 +using Radarr.Http.REST;
 +
 +namespace Radarr.Api.V3.Config
 +{
 +    // Values of the Optimize settings page. GET returns null for a number or text that is not set anywhere (it follows
-+    // the default). PUT changes only the values it carries: a missing or null value is left unchanged, like the stock
-+    // config endpoints; sending the default value resets a value (its saved value is cleared, the source becomes
-+    // "default"). Numbers are long so an out-of-range number gets the normal field error instead of a JSON error.
-+    // Tunables carries, for every tunable value of the optimization patches (also the read-only ones), its effective
-+    // value, default, bounds, source and whether an environment variable locks it; it is ignored on PUT, as are values
-+    // whose environment variable is set.
++    // the default). PUT changes only the values present in the request body, as in the Sonarr image: a value left out
++    // keeps its saved value, an explicit null resets it to the default (its saved value is cleared, the source becomes
++    // "default"); sending the default value does the same. Numbers are long so an out-of-range number gets the normal
++    // field error instead of a JSON error. Tunables carries, for every tunable value of the optimization patches (also
++    // the read-only ones), its effective value, default, bounds, source and whether an environment variable locks it;
++    // it is ignored on PUT, as are values whose environment variable is set.
 +    public class OptimizeConfigResource : RestResource
 +    {
-+        public long? IndexerRateLimitMs { get; set; }
-+        public string CacheHitHeader { get; set; }
-+        public string CacheHitValue { get; set; }
-+        public long? FfprobeTimeoutMinutes { get; set; }
++        // Names of the values present in the request body (the JSON reader calls a setter only for a property it
++        // finds). PUT changes only those: a value left out keeps what is saved, an explicit null resets it.
++        private readonly HashSet<string> _assigned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++        private long? _indexerRateLimitMs;
++        private string _cacheHitHeader;
++        private string _cacheHitValue;
++        private long? _ffprobeTimeoutMinutes;
++        private long? _grabSpacingMs;
++        private long? _customFormatCacheCapacity;
++        private long? _customFormatCacheExpiryMinutes;
++        private long? _customFormatCacheMaxInputChars;
++        private bool? _decisionBatchMemo;
++        private bool? _releaseProfileCache;
++        private long? _ffprobeCacheEntries;
++        private long? _ffprobeCacheMaxMegabytes;
++        private long? _ffprobeCacheMaxEntryKilobytes;
++        private long? _ffprobeCacheFailureMinutes;
++        private long? _ffprobeCacheIdleMinutes;
++        private long? _ffprobeCacheSettleSeconds;
++        private long? _ffprobeCacheUnsettledSeconds;
++        private long? _ffprobeCacheSweepSeconds;
 +
-+        public long? GrabSpacingMs { get; set; }
-+        public long? CustomFormatCacheCapacity { get; set; }
-+        public long? CustomFormatCacheExpiryMinutes { get; set; }
-+        public long? CustomFormatCacheMaxInputChars { get; set; }
-+        public bool? DecisionBatchMemo { get; set; }
-+        public bool? ReleaseProfileCache { get; set; }
-+        public long? FfprobeCacheEntries { get; set; }
-+        public long? FfprobeCacheMaxMegabytes { get; set; }
-+        public long? FfprobeCacheMaxEntryKilobytes { get; set; }
-+        public long? FfprobeCacheFailureMinutes { get; set; }
-+        public long? FfprobeCacheIdleMinutes { get; set; }
-+        public long? FfprobeCacheSettleSeconds { get; set; }
-+        public long? FfprobeCacheUnsettledSeconds { get; set; }
-+        public long? FfprobeCacheSweepSeconds { get; set; }
++        public long? IndexerRateLimitMs
++        {
++            get => _indexerRateLimitMs;
++            set => Set(ref _indexerRateLimitMs, value);
++        }
++
++        public string CacheHitHeader
++        {
++            get => _cacheHitHeader;
++            set => Set(ref _cacheHitHeader, value);
++        }
++
++        public string CacheHitValue
++        {
++            get => _cacheHitValue;
++            set => Set(ref _cacheHitValue, value);
++        }
++
++        public long? FfprobeTimeoutMinutes
++        {
++            get => _ffprobeTimeoutMinutes;
++            set => Set(ref _ffprobeTimeoutMinutes, value);
++        }
++
++        public long? GrabSpacingMs
++        {
++            get => _grabSpacingMs;
++            set => Set(ref _grabSpacingMs, value);
++        }
++
++        public long? CustomFormatCacheCapacity
++        {
++            get => _customFormatCacheCapacity;
++            set => Set(ref _customFormatCacheCapacity, value);
++        }
++
++        public long? CustomFormatCacheExpiryMinutes
++        {
++            get => _customFormatCacheExpiryMinutes;
++            set => Set(ref _customFormatCacheExpiryMinutes, value);
++        }
++
++        public long? CustomFormatCacheMaxInputChars
++        {
++            get => _customFormatCacheMaxInputChars;
++            set => Set(ref _customFormatCacheMaxInputChars, value);
++        }
++
++        public bool? DecisionBatchMemo
++        {
++            get => _decisionBatchMemo;
++            set => Set(ref _decisionBatchMemo, value);
++        }
++
++        public bool? ReleaseProfileCache
++        {
++            get => _releaseProfileCache;
++            set => Set(ref _releaseProfileCache, value);
++        }
++
++        public long? FfprobeCacheEntries
++        {
++            get => _ffprobeCacheEntries;
++            set => Set(ref _ffprobeCacheEntries, value);
++        }
++
++        public long? FfprobeCacheMaxMegabytes
++        {
++            get => _ffprobeCacheMaxMegabytes;
++            set => Set(ref _ffprobeCacheMaxMegabytes, value);
++        }
++
++        public long? FfprobeCacheMaxEntryKilobytes
++        {
++            get => _ffprobeCacheMaxEntryKilobytes;
++            set => Set(ref _ffprobeCacheMaxEntryKilobytes, value);
++        }
++
++        public long? FfprobeCacheFailureMinutes
++        {
++            get => _ffprobeCacheFailureMinutes;
++            set => Set(ref _ffprobeCacheFailureMinutes, value);
++        }
++
++        public long? FfprobeCacheIdleMinutes
++        {
++            get => _ffprobeCacheIdleMinutes;
++            set => Set(ref _ffprobeCacheIdleMinutes, value);
++        }
++
++        public long? FfprobeCacheSettleSeconds
++        {
++            get => _ffprobeCacheSettleSeconds;
++            set => Set(ref _ffprobeCacheSettleSeconds, value);
++        }
++
++        public long? FfprobeCacheUnsettledSeconds
++        {
++            get => _ffprobeCacheUnsettledSeconds;
++            set => Set(ref _ffprobeCacheUnsettledSeconds, value);
++        }
++
++        public long? FfprobeCacheSweepSeconds
++        {
++            get => _ffprobeCacheSweepSeconds;
++            set => Set(ref _ffprobeCacheSweepSeconds, value);
++        }
 +
 +        public List<OptimizeSettingInfo> Tunables { get; set; }
++
++        internal bool IsAssigned(string name)
++        {
++            return _assigned.Contains(name);
++        }
++
++        private void Set<T>(ref T field, T value, [CallerMemberName] string name = null)
++        {
++            field = value;
++            _assigned.Add(name);
++        }
 +    }
 +
 +    public static class OptimizeConfigResourceMapper
@@ -3901,14 +4052,13 @@ index 000000000..888bed0c0
 +            return resource;
 +        }
 +
-+        // Values by tunable name, for IOptimizeSettingsService.Save and Validate. Null values are left out: PUT leaves
-+        // them unchanged.
++        // Values by tunable name, for IOptimizeSettingsService.Save and Validate: the values present in the request
++        // (see OptimizeConfigResource), an explicit null included (it resets the value).
 +        public static Dictionary<string, object> ToValues(this OptimizeConfigResource resource)
 +        {
 +            return ValueProperties
-+                .Select(p => (Name: OptimizeTunables.Get(p.Name).Name, Value: p.GetValue(resource)))
-+                .Where(v => v.Value != null)
-+                .ToDictionary(v => v.Name, v => v.Value, StringComparer.OrdinalIgnoreCase);
++                .Where(p => resource.IsAssigned(p.Name))
++                .ToDictionary(p => OptimizeTunables.Get(p.Name).Name, p => p.GetValue(resource), StringComparer.OrdinalIgnoreCase);
 +        }
 +    }
 +}

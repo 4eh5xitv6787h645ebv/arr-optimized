@@ -13,7 +13,7 @@ changes normal operation or the media info that decisions later use, the entry s
 |---|---|
 | Upstream | `v5.0.0.3041` (`03f822c78293981e6e1459fbce59d11476b2107f`, develop) |
 | Base image | `lscr.io/linuxserver/sonarr@sha256:c8c4a3dc…` (`5.0.0.3041-ls212`, the `develop` tag) |
-| Image tag | `sonarr-optimized:5.0.0.3041-next` (local build) |
+| Image tag | `sonarr-optimized:5.0.0.3041-next` (local build); CI publishes `ghcr.io/4eh5xitv6787h645ebv/sonarr-optimized:5.0.0.3041`, `:latest` and the immutable `:5.0.0.3041-<short commit>` |
 | SDK | .NET SDK 10.0.404 (upstream `global.json`) |
 
 ## Patches
@@ -117,7 +117,9 @@ connection to read the type.
 Each value: a valid environment variable wins (the field is read-only on the page), then the value
 saved on the page, then the default. An invalid environment variable is ignored with one warning in
 the log and shown as an error under its field. Saved values are `Config` rows named
-`optimize<Name>`; stock Sonarr ignores them.
+`optimize<Name>`; stock Sonarr ignores them. The environment variables have the same names, defaults
+and bounds as in the Radarr image, so one `.env` can serve both containers (the custom-format cache
+sweep exists only here, the release-profile cache only in Radarr).
 
 | Setting | Environment variable | Default | Allowed | Notes |
 |---|---|---|---|---|
@@ -143,16 +145,27 @@ the log and shown as an error under its field. Saved values are `Config` rows na
 The ffprobe cache matches a file on its stamp alone, and a file written less than a minute ago can
 change under an unchanged stamp (coarse timestamps, attribute caches of network shares,
 preallocation). So the settle time, recently-written lifetime and failure lifetime only allow values
-at least as strict as `0007`'s. Read-only rows on the page, each with the reason it is fixed: the
-cache eviction batches, BroadcasTheNet's own limit, the scheduler interval (stock 30 s), the
-failed-import retry (stock 1-minute task), the duplicate extra-file cleanup (stock daily
-housekeeping) and the blocklist `LIKE` pattern limit (50,000 bytes, SQLite's own limit; any other
-value would make the in-memory comparison of `0004` differ from the stock SQL).
+at least as strict as `0007`'s, on the page, in the API and for the environment variables, as in the
+Radarr image: a looser environment variable (for example `ARR_FFPROBE_CACHE_SETTLE_SECONDS=10`) is
+ignored with a warning. With every default, indexer requests and grabs are timed exactly as on
+stock; ffprobe runs are not: all runs for one file share a 15-minute limit (stock has none; 0 turns
+it off), results of unchanged files are reused, and a failed probe of a settled file is not repeated
+for 10 minutes.
 
-API: `GET /api/v3/config/optimize` returns the values (`null` = not saved, the default applies) and
-the full list as `settings`. `PUT` changes only the values present in the body: a value left out
-keeps its saved value, an explicit `null` resets it to the default. Fields locked by an environment
-variable are ignored on `PUT`. Invalid values give HTTP 400 with one error per field. Risk warnings
+Read-only rows on the page, each with the reason it cannot be changed here: the cache eviction
+batches (derived from the cache sizes), BroadcasTheNet's own limit (fixed upstream), the scheduler
+interval (stock 30 s), the failed-import retry (follows the stock Refresh Monitored Downloads task,
+every minute, which stock Sonarr v5 has no setting for), the duplicate extra-file cleanup (stock
+daily housekeeping) and the blocklist `LIKE` pattern limit (50,000 bytes, SQLite's own limit; any
+other value would make the in-memory comparison of `0004` differ from the stock SQL). When a value
+changes, the log names the new value; a cleared cache hit header is logged as `off`.
+
+API (the same as in the Radarr image): `GET /api/v3/config/optimize` returns the values (a number
+or text that follows its default is left out of the JSON; on/off values are always returned) and the
+full list as `settings`. `PUT` changes only the values present in the body: a value left out keeps
+its saved value, an explicit `null` resets it to the default (the page's Reset button sends `null`;
+for an on/off value, sending its default also resets it). Fields locked by an environment variable are ignored on
+`PUT`, also a `null`. Invalid values give HTTP 400 with one error per field. Risk warnings
 are help texts on the page, not validation warnings (the stock API turns any validation warning into
 a 400). The request-wait counters on the Status section only see requests paced by the cache-hit
 limiter (cache-hit header set); with the header off, requests wait inside the stock
@@ -221,13 +234,18 @@ tests for every bug fix (each fails on stock and passes with the patch), the equ
 the speed-ups, and the Optimize page's tests (including `NzbDrone.Api.Test` for the controller). See
 `tests/CoreTest/README.md`.
 
-Full-suite result for this release (upstream filter `Category!=ManualTest&Category!=AutomationTest&
-Category!=IntegrationTest&Category!=WINDOWS`, plus `Category!=PerfNextBenchmark`): patched tree with
-every fixture added 6,118 passed, 28 skipped, 0 failed; stock `v5.0.0.3041` 5,725 passed, 27 skipped,
-0 failed. The extra skip is the PostgreSQL-only history test, which passes against PostgreSQL 16.
-`Sonarr.Api.Test` with the Optimize controller fixture: 47 passed. `Sonarr.Host.Test`: 24 passed,
-4 skipped (including both container wiring fixtures). The test projects also build with upstream's
-`TreatWarningsAsErrors=true`.
+Full-suite results for this release (upstream filter `Category!=ManualTest&Category!=AutomationTest&
+Category!=IntegrationTest&Category!=WINDOWS`, plus `Category!=PerfNextBenchmark`), patched tree with
+every fixture added: 6,117 passed, 28 skipped, 0 failed when the Optimize page was integrated; 6,118
+passed, 28 skipped, 0 failed in the repair and re-verification runs (two more fixtures); 6,119
+passed, 28 skipped, 0 failed on the final tree (the review fixes and their test). Stock
+`v5.0.0.3041`: 5,725 passed, 27 skipped, 0 failed. The extra skip is the PostgreSQL-only history
+test, which passes against PostgreSQL 16. `Sonarr.Api.Test` with the Optimize controller fixture: 47
+passed in every run. `Sonarr.Host.Test`: 24 passed, 4 skipped (including both container wiring
+fixtures). The test projects also build with upstream's `TreatWarningsAsErrors=true`. In CI, the
+wall-clock timing fixtures (`IndexerRateLimitTimingFixture`, `GrabGateHostsFixture`,
+`OptimizeLiveApplyTimingFixture`; 41 tests) run in their own step that is retried once and does not
+block publishing; every other fixture does.
 
 ## Benchmark and equivalence harness
 

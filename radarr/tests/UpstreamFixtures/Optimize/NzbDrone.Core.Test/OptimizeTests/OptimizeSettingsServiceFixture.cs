@@ -191,8 +191,66 @@ namespace NzbDrone.Core.Test.OptimizeTests
             eviction.DefaultValue.Should().Be(100L);
             eviction.HowToChange.Should().Contain("ffprobe cache entries");
 
-            list.Where(s => !s.Editable).Should().OnlyContain(s => s.SourceText == "Fixed in this build" && !string.IsNullOrWhiteSpace(s.HowToChange));
+            // The import retry follows Radarr's own "Check For Finished Downloads Interval": a stock setting, changed
+            // where stock changes it, not "fixed in this build".
+            var importRetry = list.Single(s => s.Name == OptimizeTunables.ImportRetryInterval);
+            importRetry.Editable.Should().BeFalse();
+            importRetry.Source.Should().Be("stock");
+            importRetry.SourceText.Should().Be("Stock setting");
+            importRetry.Value.Should().Be(1L);
+            importRetry.HowToChange.Should().Contain("Settings > Download Clients").And.Contain("PUT /api/v3/config/downloadclient");
+
+            list.Where(s => !s.Editable && s.Name != OptimizeTunables.ImportRetryInterval)
+                .Should().OnlyContain(s => s.Source == "fixed" && s.SourceText == "Fixed in this build" && !string.IsNullOrWhiteSpace(s.HowToChange));
             list.Where(s => s.Editable).Should().OnlyContain(s => s.HowToChange.Contains(s.EnvironmentVariable));
+        }
+
+        // The import retry row reads the stock setting live.
+        [Test]
+        public void import_retry_row_should_follow_the_stock_check_interval()
+        {
+            Mocker.GetMock<IConfigService>().SetupGet(s => s.CheckForFinishedDownloadInterval).Returns(5);
+            Subject.Reload();
+
+            Subject.GetSettings().Single(s => s.Name == OptimizeTunables.ImportRetryInterval).Value.Should().Be(5L);
+        }
+
+        // A cleared cache hit header is logged as "off", not as an empty value.
+        [Test]
+        public void clearing_the_cache_hit_header_should_log_off()
+        {
+            var messages = CaptureLog(() =>
+            {
+                Subject.Save(new Dictionary<string, object> { { OptimizeTunables.CacheHitHeader, "X-Cache" } });
+                Subject.Save(new Dictionary<string, object> { { OptimizeTunables.CacheHitHeader, null } });
+            });
+
+            messages.Should().Contain("Cache hit header is now X-Cache, saved on this page (default off)");
+            messages.Should().Contain("Cache hit header is now off, the default");
+            messages.Should().NotContain(m => m.Contains("now ,") || m.Contains("default )"));
+        }
+
+        private static List<string> CaptureLog(Action action)
+        {
+            var target = new NLog.Targets.MemoryTarget { Name = "OptimizeSettingsServiceFixture", Layout = "${message}" };
+            var rule = new NLog.Config.LoggingRule("*", NLog.LogLevel.Info, target);
+
+            NLog.LogManager.Configuration.AddTarget(target);
+            NLog.LogManager.Configuration.LoggingRules.Add(rule);
+            NLog.LogManager.ReconfigExistingLoggers();
+
+            try
+            {
+                action();
+            }
+            finally
+            {
+                NLog.LogManager.Configuration.LoggingRules.Remove(rule);
+                NLog.LogManager.Configuration.RemoveTarget(target.Name);
+                NLog.LogManager.ReconfigExistingLoggers();
+            }
+
+            return target.Logs.ToList();
         }
 
         // The list shows the value in effect: the max result size is capped by the cache memory limit, and a note

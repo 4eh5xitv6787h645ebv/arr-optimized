@@ -15,7 +15,7 @@ use, the entry says so. It is shipped as a drop-in `Radarr.Core.dll`, `Radarr.Ap
 | Upstream | `v7.0.3.10918` @ `af772b051ac27a0615c7f8b7f78622b6dc183be0` |
 | Base image | `lscr.io/linuxserver/radarr@sha256:044788f5508b7f67a3e0368cdd142c77c4d4cd5aec2efaba53e1a68b6b6231e7` (`7.0.3.10918-ls328`, the `latest` tag on 2026-11-24) |
 | SDK | .NET SDK 10.0.404 (upstream `global.json`) |
-| Image | `radarr-optimized:7.0.3.10918-next` (local build; published as `ghcr.io/4eh5xitv6787h645ebv/radarr-optimized`) |
+| Image | `radarr-optimized:7.0.3.10918-next` (local build); CI publishes `ghcr.io/4eh5xitv6787h645ebv/radarr-optimized:7.0.3.10918`, `:latest` and the immutable `:7.0.3.10918-<short commit>` |
 
 ## What the patches do
 
@@ -136,8 +136,9 @@ they could serve stale or wrong data.
 Each value: a valid environment variable wins (the field is read-only on the page), then the value
 saved on the page, then the default. An invalid environment variable is ignored with one warning in
 the log and shown as an error under its field. Saved values are `Config` rows named
-`optimize<Name>`; stock Radarr ignores them. The environment variables have the same names as in the
-Sonarr image.
+`optimize<Name>`; stock Radarr ignores them. The environment variables have the same names, defaults
+and bounds as in the Sonarr image, so one `.env` can serve both containers (the release-profile
+cache exists only here, the custom-format cache sweep only in Sonarr).
 
 | Setting | Environment variable | Default | Allowed | Notes |
 |---|---|---|---|---|
@@ -154,27 +155,40 @@ Sonarr image.
 | ffprobe cache entries | `ARR_FFPROBE_CACHE_CAPACITY` | 1000 | 0–100000, 0 = off | off = probe every read, as stock |
 | ffprobe cache memory | `ARR_FFPROBE_CACHE_MAX_MB` | 32 | 0–1024, 0 = off | |
 | ffprobe largest result | `ARR_FFPROBE_CACHE_MAX_ENTRY_KB` | 4096 | 1–131072 | capped by the cache memory; the page shows the value in effect |
-| ffprobe failure lifetime | `ARR_FFPROBE_CACHE_FAILURE_MINUTES` | 10 | 0–1440, 0 = not remembered | warning above 60 |
+| ffprobe failure lifetime | `ARR_FFPROBE_CACHE_FAILURE_MINUTES` | 10 | 0–10, 0 = not remembered | can only be shorter than `0004`'s |
 | ffprobe idle lifetime | `ARR_FFPROBE_CACHE_IDLE_MINUTES` | 360 | 1–10080 | |
-| ffprobe settle time | `ARR_FFPROBE_CACHE_SETTLE_SECONDS` | 60 | 5–3600 | warning below 30 |
-| ffprobe recently-written lifetime | `ARR_FFPROBE_CACHE_UNSETTLED_SECONDS` | 60 | 0–3600, 0 = not reused | warning above 300 |
+| ffprobe settle time | `ARR_FFPROBE_CACHE_SETTLE_SECONDS` | 60 | 60–3600 | can only be longer than `0004`'s |
+| ffprobe recently-written lifetime | `ARR_FFPROBE_CACHE_UNSETTLED_SECONDS` | 60 | 0–60, 0 = not reused | can only be shorter than `0004`'s |
 | ffprobe cache sweep | `ARR_FFPROBE_CACHE_SWEEP_SECONDS` | 60 | 1–3600 | |
 
-Unlike the Sonarr image, the ffprobe settle time, recently-written lifetime and failure lifetime
-accept values looser than `0004`'s defaults (shown with a warning). The cache matches a file on its
-stamp alone, so a settle time below 60 s or a longer recently-written lifetime can reuse media info
-of a file that changed under an unchanged stamp, and a long failure lifetime keeps a file without
-media info (and so not imported) long after a brief failure. Keep the defaults unless you know your
-storage. Read-only rows on the page, each with the reason it is fixed: the ffprobe eviction batch,
-PassThePopcorn's own limit, the import retry interval, the indexer settings-type lookup and the
-housekeeping maximum wait (30 minutes, `0010`).
+The ffprobe cache matches a file on its stamp alone, and a file written less than a minute ago can
+change under an unchanged stamp (coarse timestamps, attribute caches of network shares,
+preallocation). So the settle time, recently-written lifetime and failure lifetime only allow values
+at least as strict as `0004`'s, on the page, in the API and for the environment variables, as in the
+Sonarr image: a looser environment variable (for example `ARR_FFPROBE_CACHE_SETTLE_SECONDS=10`) is
+ignored with a warning, and a looser value saved by an earlier build is ignored (the default
+applies). With every default, indexer requests and grabs are timed exactly as on stock; ffprobe runs
+are not: all runs for one file share a 15-minute limit (stock has none; 0 turns it off), results of
+unchanged files are reused, and a failed probe of a settled file is not repeated for 10 minutes.
 
-API: `GET /api/v3/config/optimize` returns the values (Radarr's JSON leaves out values that are not
-saved) and the full list as `tunables`. `PUT` changes only the values it carries: a missing or
-`null` value is left unchanged, like the stock config endpoints, and sending a value's **default**
-resets it (the page sends cleared or reset fields as their default). Fields locked by an environment
-variable are ignored on `PUT`. Invalid values, also numbers too large for 32 bits, give HTTP 400
-with one error per field. The request-wait counters on the Status section only see requests paced
+Read-only rows on the page, each with where its value comes from and how it can be changed: the
+ffprobe eviction batch (derived from the cache size), PassThePopcorn's own limit (fixed upstream),
+the indexer settings-type lookup (fixed in this build), the housekeeping maximum wait (fixed in this
+build, `HousekeepingCommand.MaxDeferral`, 30 minutes, `0010`) and the import retry after an error,
+labelled **Stock setting**: it follows Radarr's own "Check For Finished Downloads Interval"
+(Settings > Download Clients > Completed Download Handling, shown with Show Advanced, or
+`checkForFinishedDownloadInterval` in `PUT /api/v3/config/downloadclient`). The Status section's
+"Exclusive housekeeping" entry describes the bounded wait (at most
+`HousekeepingCommand.MaxDeferralMinutes`, 30 minutes). When a value changes, the log names the new
+value; a cleared cache hit header is logged as `off`.
+
+API (the same as in the Sonarr image): `GET /api/v3/config/optimize` returns the values (a number
+or text that follows its default is left out of the JSON; on/off values are always returned) and the
+full list as `tunables`. `PUT` changes only the values present in the body: a value left out keeps
+its saved value, an explicit `null` resets it to the default (the page's Reset button sends `null`;
+for an on/off value, sending its default also resets it). Fields locked by an environment variable are ignored on
+`PUT`, also a `null`. Invalid values, also numbers too large for 32 bits, give HTTP 400 with one
+error per field. The request-wait counters on the Status section only see requests paced
 by the cache-hit limiter (cache-hit header set); with the header off, requests wait inside the
 stock `HttpClient` in `Radarr.Common`, which is not rebuilt. The page's texts are English only:
 Radarr's translation files ship next to the DLLs and are not rebuilt.
@@ -225,11 +239,18 @@ dotnet test src/NzbDrone.Core.Test/Radarr.Core.Test.csproj -c Release -p:EnableA
 The regression and equivalence fixtures for `0002`–`0010` are in `tests/UpstreamFixtures/<Group>/`;
 `tests/README.md` says how to copy and run them. Full-suite result for this release (filter
 `Category!=ManualTest&Category!=AutomationTest&Category!=IntegrationTest&Category!=WINDOWS&Category!=PerfNextBenchmark`):
-patched tree with every fixture added 4,681 passed, 26 skipped, 0 failed (in an earlier run, made
-while image builds loaded the machine, one 2-second timing check of `0002` was 0.03 s short; it passed
-on three reruns of its fixture and in this run); stock `v7.0.3.10918` 4,173 passed, 26 skipped, 0 failed. `Radarr.Api.Test` with the
-Optimize controller fixture: 39 passed. `Radarr.Host.Test`: 23 passed, 5 skipped (including both
-container wiring fixtures). The test projects also build with upstream's `TreatWarningsAsErrors=true`.
+patched tree with every fixture added: 4,676 passed, 26 skipped, **1 failed** when the Optimize page
+was integrated (made while image builds loaded the machine: `IndexerRateLimitTimingFixture`'s
+`concurrent_requests_should_keep_reserved_slot("HIT",0.0)` measured 1.87 s where 1.9–3.0 s was
+allowed; the fixture passed three reruns and every later full run); 4,681 passed, 26 skipped, 0
+failed in the repair and re-verification runs (two more fixtures); 4,691 passed, 26 skipped, 0
+failed on the final tree (the review fixes and their tests). Stock `v7.0.3.10918`: 4,173 passed, 26
+skipped, 0 failed. `Radarr.Api.Test` with the Optimize controller fixture: 39 passed, 42 on the final
+tree (the `PUT` reset tests). `Radarr.Host.Test`: 23 passed, 5 skipped (including both container
+wiring fixtures). The test projects also build with upstream's `TreatWarningsAsErrors=true`. In CI,
+the wall-clock timing fixtures (`IndexerRateLimitTimingFixture`, `GrabGateHostsFixture`,
+`OptimizeRateLimitLiveFixture`; 39 tests) run in their own step that is retried once and does not
+block publishing; every other fixture does.
 
 ## Updating to a new upstream release
 
